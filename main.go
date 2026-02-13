@@ -66,7 +66,16 @@ func runMigrate(cfg *config.Config) {
 	}
 	defer db.Close()
 
-	for _, name := range []string{"migrations/001_orders_delivery.sql", "migrations/002_orders_phone.sql", "migrations/003_menu_items.sql", "migrations/004_carts.sql", "migrations/005_checkouts.sql"} {
+	for _, name := range []string{
+		"migrations/001_orders_delivery.sql",
+		"migrations/002_orders_phone.sql",
+		"migrations/003_menu_items.sql",
+		"migrations/004_carts.sql",
+		"migrations/005_checkouts.sql",
+		"migrations/006_locations.sql",
+		"migrations/007_user_locations.sql",
+		"migrations/008_menu_items_location.sql",
+	} {
 		sql, err := os.ReadFile(name)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "read migration:", err)

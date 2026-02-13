@@ -6,6 +6,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"food-telegram/config"
@@ -97,6 +98,9 @@ type Bot struct {
 	messageBot *tgbotapi.BotAPI // bot for sending order notifications (MESSAGE_TOKEN)
 	cfg        *config.Config
 	admin      int64
+
+	locSuggestions   map[int64][]services.LocationWithDistance
+	locSuggestionsMu sync.RWMutex
 }
 
 func New(cfg *config.Config, adminUserID int64) (*Bot, error) {
@@ -105,9 +109,10 @@ func New(cfg *config.Config, adminUserID int64) (*Bot, error) {
 		return nil, err
 	}
 	bot := &Bot{
-		api:   api,
-		cfg:   cfg,
-		admin: adminUserID,
+		api:            api,
+		cfg:            cfg,
+		admin:          adminUserID,
+		locSuggestions: make(map[int64][]services.LocationWithDistance),
 	}
 	// Initialize message bot if MESSAGE_TOKEN is set
 	if cfg.Telegram.MessageToken != "" {
@@ -138,11 +143,20 @@ func (b *Bot) Start() {
 		userID := msg.From.ID
 		text := strings.TrimSpace(msg.Text)
 
+		// Handle shared location (from user flow, not admin adder)
+		if msg.Location != nil {
+			b.handleUserLocation(msg.Chat.ID, userID, msg.Location.Latitude, msg.Location.Longitude)
+			continue
+		}
+
 		switch {
 		case text == "/start":
 			b.handleStart(msg.Chat.ID, userID)
 		case text == "/menu":
 			b.sendMenu(msg.Chat.ID, userID)
+		case text == "⏭ Menyuga o'tish":
+			// User chose to skip location sharing
+			b.sendLocationSuggestionsManual(msg.Chat.ID, userID, 0)
 		case msg.Contact != nil:
 			b.handleContact(msg.Chat.ID, userID, msg.Contact.PhoneNumber)
 		case strings.HasPrefix(text, "/override"):
@@ -169,11 +183,21 @@ func (b *Bot) sendWithInline(chatID int64, text string, kb tgbotapi.InlineKeyboa
 }
 
 func (b *Bot) handleStart(chatID int64, userID int64) {
-	rows := [][]tgbotapi.InlineKeyboardButton{
-		{tgbotapi.NewInlineKeyboardButtonData("📋Menyuni ko'rish", "menu")},
+	// Ask for optional location to suggest nearby fast food places.
+	kb := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButtonLocation("📍 Lokatsiyani ulashish"),
+			tgbotapi.NewKeyboardButton("⏭ Menyuga o'tish"),
+		),
+	)
+	kb.OneTimeKeyboard = true
+	kb.ResizeKeyboard = true
+
+	msg := tgbotapi.NewMessage(chatID, "Xush kelibsiz! Agar yaqin atrofdagi fast food joylarini ko'rishni istasangiz, iltimos lokatsiyangizni ulashing. Agar xohlamasangiz, \"⏭ Menyuga o'tish\" tugmasini bosing.")
+	msg.ReplyMarkup = kb
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("send error: %v", err)
 	}
-	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
-	b.sendWithInline(chatID, "Xush kelibsiz! Menudan yeguliklar, ichimliklar yoki kekslarni tanlang.", kb)
 }
 
 func (b *Bot) categoryKeyboard() tgbotapi.InlineKeyboardMarkup {
@@ -190,10 +214,21 @@ func (b *Bot) categoryKeyboard() tgbotapi.InlineKeyboardMarkup {
 
 func (b *Bot) menuKeyboard(userID int64, category string) tgbotapi.InlineKeyboardMarkup {
 	ctx := context.Background()
-	items, err := services.ListMenuByCategory(ctx, category)
-	if err != nil {
-		log.Printf("list menu: %v", err)
-		items = nil
+	var items []models.MenuItem
+	// Try to load user's selected location; if not found, fall back to global menu
+	if loc, err := services.GetUserLocation(ctx, userID); err == nil && loc != nil {
+		items, err = services.ListMenuByCategoryAndLocation(ctx, category, loc.ID)
+		if err != nil {
+			log.Printf("list menu by location: %v", err)
+			items = nil
+		}
+	} else {
+		var err error
+		items, err = services.ListMenuByCategory(ctx, category)
+		if err != nil {
+			log.Printf("list menu: %v", err)
+			items = nil
+		}
 	}
 
 	var rows [][]tgbotapi.InlineKeyboardButton
@@ -272,6 +307,45 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 
 	switch {
 	case data == "menu":
+		b.sendMenu(chatID, userID)
+	case strings.HasPrefix(data, "locsel:"):
+		// User selected a specific fast food location
+		idStr := strings.TrimPrefix(data, "locsel:")
+		locID, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil || locID <= 0 {
+			b.send(chatID, "Noto'g'ri filial tanlandi.")
+			return
+		}
+		ctx := context.Background()
+		if err := services.SetUserLocation(ctx, userID, locID); err != nil {
+			b.send(chatID, "Filialni saqlashda xatolik yuz berdi.")
+			return
+		}
+		// Confirm selection and show button to open menu for this location
+		msgText := "✅ Filial tanlandi. Endi menyuni ko'rishingiz mumkin."
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("📋Menyuni ko'rish", "menu"),
+			),
+		)
+		b.sendWithInline(chatID, msgText, kb)
+	case strings.HasPrefix(data, "loc:page:"):
+		// Paginate location suggestions with distance (after sharing location)
+		pageStr := strings.TrimPrefix(data, "loc:page:")
+		page, _ := strconv.Atoi(pageStr)
+		if page < 0 {
+			page = 0
+		}
+		b.sendLocationSuggestions(chatID, userID, page, true)
+	case strings.HasPrefix(data, "locm:page:"):
+		// Paginate manual location suggestions (no distance)
+		pageStr := strings.TrimPrefix(data, "locm:page:")
+		page, _ := strconv.Atoi(pageStr)
+		if page < 0 {
+			page = 0
+		}
+		b.sendLocationSuggestionsManual(chatID, userID, page)
+	case data == "loc:menu":
 		b.sendMenu(chatID, userID)
 	case data == "back":
 		b.handleStart(chatID, userID)
@@ -417,6 +491,158 @@ func (b *Bot) requestPhone(chatID int64, userID int64) {
 	kb.ResizeKeyboard = true
 
 	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🛒 Buyurtma jami: %d\n\n📱 Iltimos, raqamingizni ulashing.", checkout.ItemsTotal))
+	msg.ReplyMarkup = kb
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("send error: %v", err)
+	}
+}
+
+// handleUserLocation is called when the user shares their own location on the main bot.
+// It loads all configured fast food locations and shows the nearest ones (5 per page).
+func (b *Bot) handleUserLocation(chatID int64, userID int64, lat, lon float64) {
+	ctx := context.Background()
+	locs, err := services.ListLocations(ctx)
+	if err != nil {
+		b.removeKeyboard(chatID, "Joylashuvlar ro'yxatini yuklashda xatolik yuz berdi.")
+		return
+	}
+	if len(locs) == 0 {
+		b.removeKeyboard(chatID, "Hozircha fast food joylari ro'yxatiga qo'shilmagan. Siz to'g'ridan-to'g'ri menyuga o'tishingiz mumkin.")
+		b.sendMenu(chatID, userID)
+		return
+	}
+
+	withDist := services.SortLocationsByDistance(float64(lat), float64(lon), locs)
+	b.locSuggestionsMu.Lock()
+	b.locSuggestions[userID] = withDist
+	b.locSuggestionsMu.Unlock()
+
+	b.sendLocationSuggestions(chatID, userID, 0, false)
+}
+
+// sendLocationSuggestions shows a paginated list (5 per page) of nearest fast food locations.
+// If removeKeyboard is true, it will also remove the reply keyboard.
+func (b *Bot) sendLocationSuggestions(chatID int64, userID int64, page int, fromCallback bool) {
+	const pageSize = 5
+
+	b.locSuggestionsMu.RLock()
+	list := b.locSuggestions[userID]
+	b.locSuggestionsMu.RUnlock()
+
+	if len(list) == 0 {
+		if fromCallback {
+			b.send(chatID, "Hozircha joylashuvlar topilmadi.")
+		} else {
+			b.removeKeyboard(chatID, "Hozircha joylashuvlar topilmadi.")
+		}
+		return
+	}
+
+	start := page * pageSize
+	if start >= len(list) {
+		page = 0
+		start = 0
+	}
+	end := start + pageSize
+	if end > len(list) {
+		end = len(list)
+	}
+
+	text := "📍 Sizga eng yaqin fast food joylari:\n\n"
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	for i := start; i < end; i++ {
+		l := list[i]
+		text += fmt.Sprintf("%d) %s — %.1f km\n", i+1, l.Location.Name, l.Distance)
+		// One button per location to select it
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				fmt.Sprintf("%d) %s", i+1, l.Location.Name),
+				fmt.Sprintf("locsel:%d", l.Location.ID),
+			),
+		))
+	}
+	text += "\nFilialni tanlash uchun yuqoridagi tugmalardan birini bosing.\nSahifalar orasida o'tish uchun quyidagi tugmalardan foydalaning."
+
+	var row []tgbotapi.InlineKeyboardButton
+	if page > 0 {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData("« Oldingi", fmt.Sprintf("loc:page:%d", page-1)))
+	}
+	if end < len(list) {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData("Keyingi »", fmt.Sprintf("loc:page:%d", page+1)))
+	}
+	if len(row) > 0 {
+		buttons = append(buttons, row)
+	}
+
+	kb := tgbotapi.NewInlineKeyboardMarkup(buttons...)
+
+	// For both first-time and pagination, send a single message with suggestions.
+	// (We accept that the reply keyboard may remain visible until the next message
+	// that removes it, to avoid duplicate texts.)
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = kb
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("send error: %v", err)
+	}
+}
+
+// sendLocationSuggestionsManual shows all locations without distance (for users who skipped location).
+func (b *Bot) sendLocationSuggestionsManual(chatID int64, userID int64, page int) {
+	const pageSize = 5
+
+	ctx := context.Background()
+	locs, err := services.ListLocations(ctx)
+	if err != nil {
+		b.removeKeyboard(chatID, "Joylashuvlar ro'yxatini yuklashda xatolik yuz berdi.")
+		return
+	}
+	if len(locs) == 0 {
+		b.removeKeyboard(chatID, "Hozircha fast food joylari ro'yxatiga qo'shilmagan.")
+		b.sendMenu(chatID, userID)
+		return
+	}
+
+	start := page * pageSize
+	if start >= len(locs) {
+		page = 0
+		start = 0
+	}
+	end := start + pageSize
+	if end > len(locs) {
+		end = len(locs)
+	}
+
+	text := "📍 Fast food joylari ro'yxati:\n\n"
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	for i := start; i < end; i++ {
+		l := locs[i]
+		text += fmt.Sprintf("%d) %s\n", i+1, l.Name)
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				fmt.Sprintf("%d) %s", i+1, l.Name),
+				fmt.Sprintf("locsel:%d", l.ID),
+			),
+		))
+	}
+	text += "\nFilialni tanlash uchun yuqoridagi tugmalardan birini bosing.\nSahifalar orasida o'tish uchun quyidagi tugmalardan foydalaning."
+
+	var buttonsNav [][]tgbotapi.InlineKeyboardButton
+	var row []tgbotapi.InlineKeyboardButton
+	if page > 0 {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData("« Oldingi", fmt.Sprintf("locm:page:%d", page-1)))
+	}
+	if end < len(locs) {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData("Keyingi »", fmt.Sprintf("locm:page:%d", page+1)))
+	}
+	if len(row) > 0 {
+		buttonsNav = append(buttonsNav, row)
+	}
+
+	allRows := append(buttons, buttonsNav...)
+	kb := tgbotapi.NewInlineKeyboardMarkup(allRows...)
+
+	// Remove the reply keyboard from start screen
+	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ReplyMarkup = kb
 	if _, err := b.api.Send(msg); err != nil {
 		log.Printf("send error: %v", err)

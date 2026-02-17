@@ -8,32 +8,34 @@ import (
 	"strings"
 	"sync"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"food-telegram/config"
 	"food-telegram/models"
 	"food-telegram/services"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 type adderState struct {
-	Step     string // "idle", "name", "price"
-	Category string
-	Name     string
+	Step       string // "idle", "name", "price"
+	Category   string
+	Name       string
 	LocationID int64
 }
 
 type locationAdderState struct {
-	Step string // "name", "location"
+	Step string // "name", "location", "admin_wait", "admin_id"
 	Name string
+	Lat  float64
+	Lon  float64
 }
 
 // AdderBot is the admin bot for adding menu items (uses ADDER_TOKEN, LOGIN).
 type AdderBot struct {
-	api     *tgbotapi.BotAPI
-	login   string
-	state   map[int64]*adderState
-	locState map[int64]*locationAdderState
+	api            *tgbotapi.BotAPI
+	login          string
+	state          map[int64]*adderState
+	locState       map[int64]*locationAdderState
 	activeLocation map[int64]int64 // per-admin selected location for menu items
-	stateMu sync.RWMutex
+	stateMu        sync.RWMutex
 }
 
 // NewAdderBot creates an adder bot using ADDER_TOKEN. login is the password from LOGIN.
@@ -46,10 +48,10 @@ func NewAdderBot(cfg *config.Config) (*AdderBot, error) {
 		return nil, err
 	}
 	return &AdderBot{
-		api:     api,
-		login:   strings.TrimSpace(cfg.Telegram.Login),
-		state:   make(map[int64]*adderState),
-		locState: make(map[int64]*locationAdderState),
+		api:            api,
+		login:          strings.TrimSpace(cfg.Telegram.Login),
+		state:          make(map[int64]*adderState),
+		locState:       make(map[int64]*locationAdderState),
 		activeLocation: make(map[int64]int64),
 	}, nil
 }
@@ -70,6 +72,11 @@ func (a *AdderBot) Start() {
 		msg := update.Message
 		userID := msg.From.ID
 		text := strings.TrimSpace(msg.Text)
+
+		if text == "/cancel" {
+			a.cancelFlows(msg.Chat.ID, userID)
+			continue
+		}
 
 		if text == "/start" {
 			a.handleStart(msg.Chat.ID, userID)
@@ -145,6 +152,20 @@ func (a *AdderBot) handleStart(chatID int64, userID int64) {
 		a.send(chatID, "Admin panel is not configured (LOGIN empty).")
 		return
 	}
+
+	// If already logged in, show the panel instead of asking for password again.
+	if a.isLoggedIn(userID) {
+		a.stateMu.RLock()
+		locFlow := a.locState[userID]
+		a.stateMu.RUnlock()
+		if locFlow != nil && locFlow.Step == "admin_id" {
+			a.send(chatID, "ℹ️ Siz hozir filial qo'shish jarayonidasiz.\n\n👤 Iltimos, *branch admin* ning Telegram user ID raqamini yuboring.\nAgar bekor qilmoqchi bo'lsangiz: /cancel")
+			return
+		}
+		a.sendAdminPanel(chatID, userID)
+		return
+	}
+
 	a.send(chatID, "🔒 Admin panel. Send the password to continue.")
 }
 
@@ -282,6 +303,29 @@ func (a *AdderBot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		return
 	case data == "adder:add_location":
 		a.startAddLocation(chatID, userID)
+		return
+	case data == "adder:locadmin:add":
+		// Continue add-location flow: ask for branch admin user ID.
+		a.stateMu.Lock()
+		st := a.locState[userID]
+		if st != nil {
+			st.Step = "admin_id"
+			a.locState[userID] = st
+		}
+		a.stateMu.Unlock()
+		if st == nil {
+			a.send(chatID, "No location flow active. Please start again: \"📍 Add Fast Food Location\".")
+			return
+		}
+		a.send(chatID, "👤 Send the *Telegram user ID* of the branch admin.\n\n💡 To get the correct ID, tell the user to use @userinfobot.")
+		return
+	case data == "adder:locadmin:cancel":
+		// Cancel add-location flow without saving anything.
+		a.stateMu.Lock()
+		delete(a.locState, userID)
+		a.stateMu.Unlock()
+		a.send(chatID, "❌ Cancelled. Location was not saved because no admin was assigned.")
+		a.sendAdminPanel(chatID, userID)
 		return
 	case strings.HasPrefix(data, "adder:setloc:"):
 		idStr := strings.TrimPrefix(data, "adder:setloc:")
@@ -439,33 +483,76 @@ func (a *AdderBot) handleLocationAddFlow(msg *tgbotapi.Message, userID int64, te
 			a.send(msg.Chat.ID, "Please send the location using Telegram's location button.")
 			return true
 		}
-		lat := msg.Location.Latitude
-		lon := msg.Location.Longitude
+		lat := float64(msg.Location.Latitude)
+		lon := float64(msg.Location.Longitude)
 
-		ctx := context.Background()
-		id, err := services.AddLocation(ctx, st.Name, float64(lat), float64(lon))
-
+		// Save coords in state and require admin assignment before inserting into DB.
+		st.Lat = lat
+		st.Lon = lon
+		st.Step = "admin_wait"
 		a.stateMu.Lock()
-		delete(a.locState, userID)
+		a.locState[userID] = st
 		a.stateMu.Unlock()
 
-		if err != nil {
-			a.send(msg.Chat.ID, "Failed to save location: "+err.Error())
-			return true
-		}
-
-		// Remove keyboard
-		removeKb := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("✅ Saved fast food location \"%s\" (id %d).", st.Name, id))
+		// Remove reply keyboard, then show inline actions to assign admin.
+		removeKb := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📍 Location received for \"%s\".\n\n⚠️ This branch will be saved *only after* you assign a branch admin.", st.Name))
 		removeKb.ReplyMarkup = tgbotapi.NewRemoveKeyboard(true)
 		if _, err := a.api.Send(removeKb); err != nil {
 			log.Printf("adder send error: %v", err)
 		}
 
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("➕ Add admin", "adder:locadmin:add"),
+				tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "adder:locadmin:cancel"),
+			),
+		)
+		a.sendWithInline(msg.Chat.ID, "Assign a branch admin to complete saving this location.", kb)
+		return true
+	case "admin_id":
+		// Expect numeric Telegram user ID for branch admin.
+		adminID, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+		if err != nil || adminID <= 0 {
+			// Users often paste the admin password here by mistake due to /start prompt.
+			a.send(msg.Chat.ID, "❌ Invalid user ID. This step expects a *numeric Telegram user ID* (masalan: 123456789), not the admin password.\n\n💡 Ask the user to use @userinfobot to get their ID.\nBekor qilish: /cancel")
+			return true
+		}
+
+		ctx := context.Background()
+		locID, err := services.CreateLocationWithAdmin(ctx, st.Name, st.Lat, st.Lon, adminID, userID)
+		if err != nil {
+			a.send(msg.Chat.ID, "Failed to save location + admin: "+err.Error())
+			log.Printf("failed to create location with admin (name=%q): %v", st.Name, err)
+			return true
+		}
+
+		a.stateMu.Lock()
+		delete(a.locState, userID)
+		// Set as active location for menu items for convenience
+		a.activeLocation[userID] = locID
+		a.stateMu.Unlock()
+
+		a.send(msg.Chat.ID, fmt.Sprintf("✅ Saved fast food location \"%s\" (id %d) and assigned admin user ID %d.", st.Name, locID, adminID))
 		a.sendAdminPanel(msg.Chat.ID, userID)
 		return true
 	default:
 		return false
 	}
+}
+
+func (a *AdderBot) cancelFlows(chatID int64, userID int64) {
+	a.stateMu.Lock()
+	delete(a.state, userID)
+	delete(a.locState, userID)
+	a.stateMu.Unlock()
+
+	if a.isLoggedIn(userID) {
+		a.send(chatID, "✅ Cancelled. Admin panel opened.")
+		a.sendAdminPanel(chatID, userID)
+		return
+	}
+	a.send(chatID, "✅ Cancelled.")
+	a.handleStart(chatID, userID)
 }
 
 // sendSelectLocationList shows all locations so admin can pick an active one for menu items.
@@ -495,4 +582,3 @@ func (a *AdderBot) sendSelectLocationList(chatID int64, userID int64) {
 	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
 	a.sendWithInline(chatID, "Filialni tanlang, shundan so'ng menyudagi mahsulotlar shu filialga bog'lanadi.", kb)
 }
-

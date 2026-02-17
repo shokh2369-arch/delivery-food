@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"food-telegram/config"
+	"food-telegram/db"
 	"food-telegram/models"
 	"food-telegram/services"
 
@@ -101,6 +102,9 @@ type Bot struct {
 
 	locSuggestions   map[int64][]services.LocationWithDistance
 	locSuggestionsMu sync.RWMutex
+
+	userSharedCoords   map[int64]struct{ Lat, Lon float64 } // Store user's shared location coordinates
+	userSharedCoordsMu sync.RWMutex
 }
 
 func New(cfg *config.Config, adminUserID int64) (*Bot, error) {
@@ -109,10 +113,11 @@ func New(cfg *config.Config, adminUserID int64) (*Bot, error) {
 		return nil, err
 	}
 	bot := &Bot{
-		api:            api,
-		cfg:            cfg,
-		admin:          adminUserID,
-		locSuggestions: make(map[int64][]services.LocationWithDistance),
+		api:              api,
+		cfg:              cfg,
+		admin:            adminUserID,
+		locSuggestions:   make(map[int64][]services.LocationWithDistance),
+		userSharedCoords: make(map[int64]struct{ Lat, Lon float64 }),
 	}
 	// Initialize message bot if MESSAGE_TOKEN is set
 	if cfg.Telegram.MessageToken != "" {
@@ -153,16 +158,28 @@ func (b *Bot) Start() {
 		case text == "/start":
 			b.handleStart(msg.Chat.ID, userID)
 		case text == "/menu":
-			b.sendMenu(msg.Chat.ID, userID)
-		case text == "⏭ Menyuga o'tish":
-			// User chose to skip location sharing
-			b.sendLocationSuggestionsManual(msg.Chat.ID, userID, 0)
+			// Check if user has shared location before showing menu
+			b.userSharedCoordsMu.RLock()
+			_, hasLocation := b.userSharedCoords[userID]
+			b.userSharedCoordsMu.RUnlock()
+			if !hasLocation {
+				b.send(msg.Chat.ID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
+				b.handleStart(msg.Chat.ID, userID)
+			} else {
+				b.sendMenu(msg.Chat.ID, userID)
+			}
 		case msg.Contact != nil:
 			b.handleContact(msg.Chat.ID, userID, msg.Contact.PhoneNumber)
 		case strings.HasPrefix(text, "/override"):
 			b.handleOverride(msg.Chat.ID, userID, text)
 		case strings.HasPrefix(text, "/stats"):
 			b.handleStats(msg.Chat.ID, userID, text)
+		case strings.HasPrefix(text, "/promote"):
+			b.handlePromote(msg.Chat.ID, userID, text)
+		case strings.HasPrefix(text, "/list_admins"):
+			b.handleListAdmins(msg.Chat.ID, userID, text)
+		case strings.HasPrefix(text, "/remove_admin"):
+			b.handleRemoveAdmin(msg.Chat.ID, userID, text)
 		}
 	}
 }
@@ -183,17 +200,16 @@ func (b *Bot) sendWithInline(chatID int64, text string, kb tgbotapi.InlineKeyboa
 }
 
 func (b *Bot) handleStart(chatID int64, userID int64) {
-	// Ask for optional location to suggest nearby fast food places.
+	// Require location sharing before proceeding
 	kb := tgbotapi.NewReplyKeyboard(
 		tgbotapi.NewKeyboardButtonRow(
 			tgbotapi.NewKeyboardButtonLocation("📍 Lokatsiyani ulashish"),
-			tgbotapi.NewKeyboardButton("⏭ Menyuga o'tish"),
 		),
 	)
 	kb.OneTimeKeyboard = true
 	kb.ResizeKeyboard = true
 
-	msg := tgbotapi.NewMessage(chatID, "Xush kelibsiz! Agar yaqin atrofdagi fast food joylarini ko'rishni istasangiz, iltimos lokatsiyangizni ulashing. Agar xohlamasangiz, \"⏭ Menyuga o'tish\" tugmasini bosing.")
+	msg := tgbotapi.NewMessage(chatID, "Xush kelibsiz! Buyurtma berish uchun lokatsiyangizni ulashing. Iltimos, \"📍 Lokatsiyani ulashish\" tugmasini bosing.")
 	msg.ReplyMarkup = kb
 	if _, err := b.api.Send(msg); err != nil {
 		log.Printf("send error: %v", err)
@@ -256,6 +272,16 @@ func (b *Bot) menuKeyboard(userID int64, category string) tgbotapi.InlineKeyboar
 }
 
 func (b *Bot) sendMenu(chatID int64, userID int64) {
+	// Verify user has shared location
+	b.userSharedCoordsMu.RLock()
+	_, hasLocation := b.userSharedCoords[userID]
+	b.userSharedCoordsMu.RUnlock()
+	if !hasLocation {
+		b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
+		b.handleStart(chatID, userID)
+		return
+	}
+
 	ctx := context.Background()
 	cart, _ := b.getCart(ctx, userID)
 
@@ -277,6 +303,16 @@ func (b *Bot) sendMenu(chatID int64, userID int64) {
 }
 
 func (b *Bot) sendCategoryMenu(chatID int64, userID int64, category string) {
+	// Verify user has shared location
+	b.userSharedCoordsMu.RLock()
+	_, hasLocation := b.userSharedCoords[userID]
+	b.userSharedCoordsMu.RUnlock()
+	if !hasLocation {
+		b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
+		b.handleStart(chatID, userID)
+		return
+	}
+
 	ctx := context.Background()
 	cart, _ := b.getCart(ctx, userID)
 
@@ -307,7 +343,16 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 
 	switch {
 	case data == "menu":
-		b.sendMenu(chatID, userID)
+		// Check if user has shared location before showing menu
+		b.userSharedCoordsMu.RLock()
+		_, hasLocation := b.userSharedCoords[userID]
+		b.userSharedCoordsMu.RUnlock()
+		if !hasLocation {
+			b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
+			b.handleStart(chatID, userID)
+		} else {
+			b.sendMenu(chatID, userID)
+		}
 	case strings.HasPrefix(data, "locsel:"):
 		// User selected a specific fast food location
 		idStr := strings.TrimPrefix(data, "locsel:")
@@ -350,9 +395,27 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 	case data == "back":
 		b.handleStart(chatID, userID)
 	case data == "back_cats":
-		b.sendMenu(chatID, userID)
+		// Check location before showing menu
+		b.userSharedCoordsMu.RLock()
+		_, hasLocation := b.userSharedCoords[userID]
+		b.userSharedCoordsMu.RUnlock()
+		if !hasLocation {
+			b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
+			b.handleStart(chatID, userID)
+		} else {
+			b.sendMenu(chatID, userID)
+		}
 	case strings.HasPrefix(data, "cat:"):
-		b.sendCategoryMenu(chatID, userID, strings.TrimPrefix(data, "cat:"))
+		// Check location before showing category menu
+		b.userSharedCoordsMu.RLock()
+		_, hasLocation := b.userSharedCoords[userID]
+		b.userSharedCoordsMu.RUnlock()
+		if !hasLocation {
+			b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
+			b.handleStart(chatID, userID)
+		} else {
+			b.sendCategoryMenu(chatID, userID, strings.TrimPrefix(data, "cat:"))
+		}
 	case strings.HasPrefix(data, "add:"):
 		rest := strings.TrimPrefix(data, "add:")
 		parts := strings.SplitN(rest, ":", 2)
@@ -367,14 +430,33 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 	case data == "confirm_final":
 		b.requestPhone(chatID, userID)
 	case strings.HasPrefix(data, "suggest:"):
-		cat := strings.TrimPrefix(data, "suggest:")
-		if cat == "food" || cat == "drink" || cat == "dessert" {
-			b.sendCategoryMenu(chatID, userID, cat)
+		// Check location before showing suggestions
+		b.userSharedCoordsMu.RLock()
+		_, hasLocation := b.userSharedCoords[userID]
+		b.userSharedCoordsMu.RUnlock()
+		if !hasLocation {
+			b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
+			b.handleStart(chatID, userID)
+		} else {
+			cat := strings.TrimPrefix(data, "suggest:")
+			if cat == "food" || cat == "drink" || cat == "dessert" {
+				b.sendCategoryMenu(chatID, userID, cat)
+			}
 		}
 	}
 }
 
 func (b *Bot) addToCart(chatID int64, userID int64, itemID string, category string, editMsgID int) {
+	// Verify user has shared location before adding to cart
+	b.userSharedCoordsMu.RLock()
+	_, hasLocation := b.userSharedCoords[userID]
+	b.userSharedCoordsMu.RUnlock()
+	if !hasLocation {
+		b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
+		b.handleStart(chatID, userID)
+		return
+	}
+
 	ctx := context.Background()
 	item, err := services.GetMenuItem(ctx, itemID)
 	if err != nil || item == nil {
@@ -418,6 +500,16 @@ func (b *Bot) addToCart(chatID int64, userID int64, itemID string, category stri
 
 // sendSuggestionScreen shows "Add something more?" with inline: missing categories (Drinks, Desserts, Foods) + Confirm order.
 func (b *Bot) sendSuggestionScreen(chatID int64, userID int64) {
+	// Verify user has shared location
+	b.userSharedCoordsMu.RLock()
+	_, hasLocation := b.userSharedCoords[userID]
+	b.userSharedCoordsMu.RUnlock()
+	if !hasLocation {
+		b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
+		b.handleStart(chatID, userID)
+		return
+	}
+
 	ctx := context.Background()
 	cart, err := b.getCart(ctx, userID)
 	if err != nil || cart == nil || len(cart.Items) == 0 {
@@ -461,6 +553,16 @@ func (b *Bot) sendSuggestionScreen(chatID int64, userID int64) {
 }
 
 func (b *Bot) requestPhone(chatID int64, userID int64) {
+	// Verify user has shared location before requesting phone
+	b.userSharedCoordsMu.RLock()
+	_, hasLocation := b.userSharedCoords[userID]
+	b.userSharedCoordsMu.RUnlock()
+	if !hasLocation {
+		b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
+		b.handleStart(chatID, userID)
+		return
+	}
+
 	ctx := context.Background()
 	cart, err := b.getCart(ctx, userID)
 	if err != nil || cart == nil || len(cart.Items) == 0 {
@@ -507,7 +609,8 @@ func (b *Bot) handleUserLocation(chatID int64, userID int64, lat, lon float64) {
 		return
 	}
 	if len(locs) == 0 {
-		b.removeKeyboard(chatID, "Hozircha fast food joylari ro'yxatiga qo'shilmagan. Siz to'g'ridan-to'g'ri menyuga o'tishingiz mumkin.")
+		// Even if no branches exist, user has shared location, so allow menu access
+		b.removeKeyboard(chatID, "Hozircha fast food joylari ro'yxatiga qo'shilmagan. Lekin siz menyuni ko'rishingiz mumkin.")
 		b.sendMenu(chatID, userID)
 		return
 	}
@@ -516,6 +619,11 @@ func (b *Bot) handleUserLocation(chatID int64, userID int64, lat, lon float64) {
 	b.locSuggestionsMu.Lock()
 	b.locSuggestions[userID] = withDist
 	b.locSuggestionsMu.Unlock()
+
+	// Store user's shared coordinates
+	b.userSharedCoordsMu.Lock()
+	b.userSharedCoords[userID] = struct{ Lat, Lon float64 }{Lat: lat, Lon: lon}
+	b.userSharedCoordsMu.Unlock()
 
 	b.sendLocationSuggestions(chatID, userID, 0, false)
 }
@@ -650,6 +758,16 @@ func (b *Bot) sendLocationSuggestionsManual(chatID int64, userID int64, page int
 }
 
 func (b *Bot) handleContact(chatID int64, userID int64, phone string) {
+	// Verify user has shared location before allowing order creation
+	b.userSharedCoordsMu.RLock()
+	_, hasLocation := b.userSharedCoords[userID]
+	b.userSharedCoordsMu.RUnlock()
+	if !hasLocation {
+		b.removeKeyboard(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
+		b.handleStart(chatID, userID)
+		return
+	}
+
 	ctx := context.Background()
 	checkout, err := services.GetCheckout(ctx, userID)
 	if err != nil || checkout == nil || len(checkout.CartItems) == 0 {
@@ -663,6 +781,23 @@ func (b *Bot) handleContact(chatID int64, userID int64, phone string) {
 		items[i] = serviceToCartItem(sci)
 	}
 	services.DeleteCheckout(ctx, userID)
+
+	// Get user's selected location for order and notification
+	var userLocation *models.Location
+	if loc, err := services.GetUserLocation(ctx, userID); err == nil && loc != nil {
+		userLocation = loc
+	}
+
+	// Get user's shared coordinates
+	var userLat, userLon float64
+	var hasUserLocation bool
+	b.userSharedCoordsMu.RLock()
+	if coords, ok := b.userSharedCoords[userID]; ok {
+		userLat = coords.Lat
+		userLon = coords.Lon
+		hasUserLocation = true
+	}
+	b.userSharedCoordsMu.RUnlock()
 
 	id, err := services.CreateOrder(ctx, models.CreateOrderInput{
 		UserID:      userID,
@@ -685,29 +820,78 @@ func (b *Bot) handleContact(chatID int64, userID int64, phone string) {
 	))
 
 	// Send order notification to admin
-	b.notifyAdmin(id, phone, items, itemsTotal)
+	b.notifyAdmin(id, phone, items, itemsTotal, userLocation, userLat, userLon, hasUserLocation)
 }
 
-func (b *Bot) notifyAdmin(orderID int64, phone string, items []cartItem, total int64) {
-	if b.admin == 0 {
-		return // Admin ID not set
-	}
+func (b *Bot) notifyAdmin(orderID int64, phone string, items []cartItem, total int64, location *models.Location, userLat, userLon float64, hasUserLocation bool) {
 	if b.messageBot == nil {
 		return // MESSAGE_TOKEN not set or failed to initialize
 	}
 
-	text := fmt.Sprintf("🆕 Yangi buyurtma #%d\n\n ", orderID)
+	// Build order details text message
+	text := fmt.Sprintf("🆕 Yangi buyurtma #%d\n\n", orderID)
 	text += fmt.Sprintf("📱 Raqam: %s\n\n", phone)
+
+	// Add location references in text (locations will be sent as separate location messages)
+	if hasUserLocation {
+		text += "📍 Foydalanuvchi lokatsiyasi (quyida yuboriladi)\n"
+	}
+	if location != nil {
+		text += fmt.Sprintf("🏪 Filial: %s (quyida yuboriladi)\n", location.Name)
+	}
+	if hasUserLocation || location != nil {
+		text += "\n"
+	}
+
 	text += "🛒 *Savatcha:*\n"
 	for _, it := range items {
 		text += fmt.Sprintf("• %s × %d — %d\n", it.Name, it.Qty, it.Price*int64(it.Qty))
 	}
 	text += fmt.Sprintf("\n💵 *Jami: %d*", total)
 
-	msg := tgbotapi.NewMessage(b.admin, text)
-	msg.ParseMode = "Markdown"
-	if _, err := b.messageBot.Send(msg); err != nil {
-		log.Printf("failed to notify admin via MESSAGE_TOKEN: %v", err)
+	// Get branch admins for the selected location
+	var adminIDs []int64
+	ctx := context.Background()
+	if location != nil {
+		var err error
+		adminIDs, err = services.GetBranchAdmins(ctx, location.ID)
+		if err != nil {
+			log.Printf("failed to get branch admins for location %d: %v", location.ID, err)
+		}
+		log.Printf("found %d branch admin(s) for location '%s' (ID: %d)", len(adminIDs), location.Name, location.ID)
+	}
+
+	// If no branch admins found, fall back to main admin
+	if len(adminIDs) == 0 {
+		if b.admin != 0 {
+			adminIDs = []int64{b.admin}
+			log.Printf("no branch admins found, using main admin %d", b.admin)
+		} else {
+			log.Printf("warning: no branch admins found and no main admin set for order #%d", orderID)
+			return
+		}
+	}
+
+	// Send order details and location to each branch admin
+	for _, adminID := range adminIDs {
+		// Send order details text message
+		msg := tgbotapi.NewMessage(adminID, text)
+		msg.ParseMode = "Markdown"
+		if _, err := b.messageBot.Send(msg); err != nil {
+			log.Printf("failed to send order details to admin %d via MESSAGE_TOKEN: %v", adminID, err)
+			continue
+		}
+		log.Printf("successfully sent order details for order #%d to branch admin %d", orderID, adminID)
+
+		// Send user's shared location as a real Telegram location message
+		if hasUserLocation {
+			locMsg := tgbotapi.NewLocation(adminID, userLat, userLon)
+			if _, err := b.messageBot.Send(locMsg); err != nil {
+				log.Printf("failed to send user location to admin %d via MESSAGE_TOKEN: %v", adminID, err)
+			} else {
+				log.Printf("successfully sent user location (%.6f, %.6f) for order #%d to admin %d", userLat, userLon, orderID, adminID)
+			}
+		}
 	}
 }
 
@@ -775,4 +959,171 @@ func (b *Bot) handleStats(chatID int64, userID int64, text string) {
 		date, stats.OrdersCount, stats.ItemsRevenue, stats.DeliveryRevenue, stats.GrandRevenue, stats.OverridesCount,
 	)
 	b.send(chatID, msg)
+}
+
+// handlePromote handles the /promote command to add a branch admin
+// Usage: /promote <branch_location_id> <new_admin_user_id>
+func (b *Bot) handlePromote(chatID int64, userID int64, text string) {
+	// Check if user is main admin
+	if userID != b.admin {
+		b.send(chatID, "❌ Unauthorized. Only main admin can promote branch admins.")
+		return
+	}
+
+	parts := strings.Fields(text)
+	if len(parts) < 3 {
+		b.send(chatID, "📝 Usage: /promote <branch_location_id> <new_admin_user_id>\n\n"+
+			"Example: /promote 1 123456789\n\n"+
+			"💡 To get a user's ID, ask them to use @userinfobot on Telegram.")
+		return
+	}
+
+	branchLocationID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || branchLocationID <= 0 {
+		b.send(chatID, "❌ Invalid branch location ID. Must be a positive number.")
+		log.Printf("invalid branch location ID provided: %s", parts[1])
+		return
+	}
+
+	newAdminID, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || newAdminID <= 0 {
+		b.send(chatID, "❌ Invalid admin user ID. Must be a positive number.\n\n"+
+			"💡 To get a user's ID, ask them to use @userinfobot on Telegram.")
+		log.Printf("invalid admin user ID provided: %s", parts[2])
+		return
+	}
+
+	ctx := context.Background()
+	err = services.AddBranchAdmin(ctx, branchLocationID, newAdminID, userID)
+	if err != nil {
+		b.send(chatID, "❌ Failed to promote admin: "+err.Error())
+		log.Printf("failed to promote admin %d for branch %d by admin %d: %v", newAdminID, branchLocationID, userID, err)
+		return
+	}
+
+	// Get branch name for confirmation
+	var branchName string
+	err = db.Pool.QueryRow(ctx, `SELECT name FROM locations WHERE id = $1`, branchLocationID).Scan(&branchName)
+	if err != nil {
+		branchName = fmt.Sprintf("Branch #%d", branchLocationID)
+	}
+
+	b.send(chatID, fmt.Sprintf("✅ Successfully promoted user %d as admin for branch '%s' (ID: %d)", newAdminID, branchName, branchLocationID))
+	log.Printf("admin %d promoted user %d as admin for branch %d (%s)", userID, newAdminID, branchLocationID, branchName)
+}
+
+// handleListAdmins lists all admins for a branch
+// Usage: /list_admins <branch_location_id>
+func (b *Bot) handleListAdmins(chatID int64, userID int64, text string) {
+	ctx := context.Background()
+	// Safety net: if migrations weren't applied, create the table on-demand.
+	if err := services.EnsureBranchAdminsTable(ctx); err != nil {
+		b.send(chatID, "❌ DB error: "+err.Error())
+		log.Printf("ensure branch_admins table: %v", err)
+		return
+	}
+
+	// Check if user is main admin or branch admin
+	if userID != b.admin {
+		// Check if user is a branch admin for any branch
+		rows, err := db.Pool.Query(ctx, `SELECT branch_location_id FROM branch_admins WHERE admin_user_id = $1 LIMIT 1`, userID)
+		if err != nil || !rows.Next() {
+			b.send(chatID, "❌ Unauthorized. Only admins can list branch admins.")
+			if rows != nil {
+				rows.Close()
+			}
+			return
+		}
+		rows.Close()
+	}
+
+	parts := strings.Fields(text)
+	if len(parts) < 2 {
+		b.send(chatID, "📝 Usage: /list_admins <branch_location_id>")
+		return
+	}
+
+	branchLocationID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || branchLocationID <= 0 {
+		b.send(chatID, "❌ Invalid branch location ID. Must be a positive number.")
+		return
+	}
+
+	admins, err := services.ListBranchAdmins(ctx, branchLocationID)
+	if err != nil {
+		b.send(chatID, "❌ Failed to list admins: "+err.Error())
+		log.Printf("failed to list admins for branch %d: %v", branchLocationID, err)
+		return
+	}
+
+	if len(admins) == 0 {
+		b.send(chatID, fmt.Sprintf("ℹ️ No admins found for branch location ID %d.", branchLocationID))
+		return
+	}
+
+	// Get branch name
+	var branchName string
+	err = db.Pool.QueryRow(ctx, `SELECT name FROM locations WHERE id = $1`, branchLocationID).Scan(&branchName)
+	if err != nil {
+		branchName = fmt.Sprintf("Branch #%d", branchLocationID)
+	}
+
+	msg := fmt.Sprintf("👥 Admins for '%s' (ID: %d):\n\n", branchName, branchLocationID)
+	for i, admin := range admins {
+		msg += fmt.Sprintf("%d. User ID: %d\n   Promoted by: %d\n   Promoted at: %s\n\n", i+1, admin.AdminUserID, admin.PromotedBy, admin.PromotedAt)
+	}
+	b.send(chatID, msg)
+	log.Printf("listed %d admins for branch %d by user %d", len(admins), branchLocationID, userID)
+}
+
+// handleRemoveAdmin removes an admin from a branch
+// Usage: /remove_admin <branch_location_id> <admin_user_id>
+func (b *Bot) handleRemoveAdmin(chatID int64, userID int64, text string) {
+	// Check if user is main admin
+	if userID != b.admin {
+		b.send(chatID, "❌ Unauthorized. Only main admin can remove branch admins.")
+		return
+	}
+
+	parts := strings.Fields(text)
+	if len(parts) < 3 {
+		b.send(chatID, "📝 Usage: /remove_admin <branch_location_id> <admin_user_id>")
+		return
+	}
+
+	branchLocationID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || branchLocationID <= 0 {
+		b.send(chatID, "❌ Invalid branch location ID. Must be a positive number.")
+		return
+	}
+
+	adminID, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || adminID <= 0 {
+		b.send(chatID, "❌ Invalid admin user ID. Must be a positive number.")
+		return
+	}
+
+	ctx := context.Background()
+	// Safety net: if migrations weren't applied, create the table on-demand.
+	if err := services.EnsureBranchAdminsTable(ctx); err != nil {
+		b.send(chatID, "❌ DB error: "+err.Error())
+		log.Printf("ensure branch_admins table: %v", err)
+		return
+	}
+	err = services.RemoveBranchAdmin(ctx, branchLocationID, adminID)
+	if err != nil {
+		b.send(chatID, "❌ Failed to remove admin: "+err.Error())
+		log.Printf("failed to remove admin %d from branch %d by admin %d: %v", adminID, branchLocationID, userID, err)
+		return
+	}
+
+	// Get branch name
+	var branchName string
+	err = db.Pool.QueryRow(ctx, `SELECT name FROM locations WHERE id = $1`, branchLocationID).Scan(&branchName)
+	if err != nil {
+		branchName = fmt.Sprintf("Branch #%d", branchLocationID)
+	}
+
+	b.send(chatID, fmt.Sprintf("✅ Successfully removed user %d as admin from branch '%s' (ID: %d)", adminID, branchName, branchLocationID))
+	log.Printf("admin %d removed user %d as admin from branch %d (%s)", userID, adminID, branchLocationID, branchName)
 }

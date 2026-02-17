@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"food-telegram/bot"
 	"food-telegram/config"
@@ -33,6 +34,15 @@ func main() {
 	}
 	defer db.Close()
 
+	// Optional auto-migration (useful in production and for fresh DBs).
+	// Set AUTO_MIGRATE=1 (or "true") to enable.
+	if v := strings.TrimSpace(os.Getenv("AUTO_MIGRATE")); v == "1" || strings.EqualFold(v, "true") {
+		if err := applyMigrations(context.Background(), false); err != nil {
+			fmt.Fprintln(os.Stderr, "migrate:", err)
+			os.Exit(1)
+		}
+	}
+
 	adminID := int64(0)
 	if v := os.Getenv("ADMIN_ID"); v != "" {
 		fmt.Sscanf(v, "%d", &adminID)
@@ -52,7 +62,7 @@ func main() {
 			os.Exit(1)
 		}
 		go adder.Start()
-		fmt.Println("Adder bot started (admin add menu).")
+		fmt.Println("Qo'shuvchi bot ishga tushdi.")
 	}
 
 	fmt.Println("Bot started.")
@@ -66,26 +76,8 @@ func runMigrate(cfg *config.Config) {
 	}
 	defer db.Close()
 
-	for _, name := range []string{
-		"migrations/001_orders_delivery.sql",
-		"migrations/002_orders_phone.sql",
-		"migrations/003_menu_items.sql",
-		"migrations/004_carts.sql",
-		"migrations/005_checkouts.sql",
-		"migrations/006_locations.sql",
-		"migrations/007_user_locations.sql",
-		"migrations/008_menu_items_location.sql",
-	} {
-		sql, err := os.ReadFile(name)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "read migration:", err)
-			os.Exit(1)
-		}
-		_, err = db.Pool.Exec(context.Background(), string(sql))
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "migrate:", err)
-			os.Exit(1)
-		}
-		fmt.Println("Migration", name, "applied.")
+	if err := applyMigrations(context.Background(), true); err != nil {
+		fmt.Fprintln(os.Stderr, "migrate:", err)
+		os.Exit(1)
 	}
 }

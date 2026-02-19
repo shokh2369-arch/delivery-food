@@ -20,6 +20,26 @@ func AddLocation(ctx context.Context, name string, lat, lon float64) (int64, err
 	return id, err
 }
 
+// GetLocationName returns the name of a location by ID, or empty string if not found.
+func GetLocationName(ctx context.Context, id int64) (string, error) {
+	var name string
+	err := db.Pool.QueryRow(ctx, `SELECT name FROM locations WHERE id = $1`, id).Scan(&name)
+	if err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// GetLocationByID returns a location by ID with coordinates, or nil if not found.
+func GetLocationByID(ctx context.Context, id int64) (*models.Location, error) {
+	var l models.Location
+	err := db.Pool.QueryRow(ctx, `SELECT id, name, lat, lon FROM locations WHERE id = $1`, id).Scan(&l.ID, &l.Name, &l.Lat, &l.Lon)
+	if err != nil {
+		return nil, err
+	}
+	return &l, nil
+}
+
 // ListLocations returns all configured locations.
 func ListLocations(ctx context.Context) ([]models.Location, error) {
 	rows, err := db.Pool.Query(ctx, `

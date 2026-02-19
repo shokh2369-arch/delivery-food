@@ -131,7 +131,20 @@ func New(cfg *config.Config, adminUserID int64) (*Bot, error) {
 	return bot, nil
 }
 
+// GetAPI returns the main bot API (for driver bot to send customer notifications).
+func (b *Bot) GetAPI() *tgbotapi.BotAPI {
+	return b.api
+}
+
+// GetMessageBot returns the message bot API (for driver bot to send admin notifications).
+func (b *Bot) GetMessageBot() *tgbotapi.BotAPI {
+	return b.messageBot
+}
+
 func (b *Bot) Start() {
+	if b.messageBot != nil {
+		go b.startOrderStatusCallbacks()
+	}
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	updates := b.api.GetUpdatesChan(u)
@@ -169,7 +182,11 @@ func (b *Bot) Start() {
 				b.sendMenu(msg.Chat.ID, userID)
 			}
 		case msg.Contact != nil:
-			b.handleContact(msg.Chat.ID, userID, msg.Contact.PhoneNumber)
+			username := ""
+			if msg.From != nil && msg.From.UserName != "" {
+				username = msg.From.UserName
+			}
+			b.handleContact(msg.Chat.ID, userID, msg.Contact.PhoneNumber, username)
 		case strings.HasPrefix(text, "/override"):
 			b.handleOverride(msg.Chat.ID, userID, text)
 		case strings.HasPrefix(text, "/stats"):
@@ -757,7 +774,7 @@ func (b *Bot) sendLocationSuggestionsManual(chatID int64, userID int64, page int
 	}
 }
 
-func (b *Bot) handleContact(chatID int64, userID int64, phone string) {
+func (b *Bot) handleContact(chatID int64, userID int64, phone string, customerUsername string) {
 	// Verify user has shared location before allowing order creation
 	b.userSharedCoordsMu.RLock()
 	_, hasLocation := b.userSharedCoords[userID]
@@ -799,15 +816,27 @@ func (b *Bot) handleContact(chatID int64, userID int64, phone string) {
 	}
 	b.userSharedCoordsMu.RUnlock()
 
+	locationID := int64(0)
+	if userLocation != nil {
+		locationID = userLocation.ID
+	}
+	// Calculate distance from restaurant to customer delivery location
+	var distanceKm float64
+	var deliveryFee int64
+	if hasUserLocation && userLocation != nil {
+		distanceKm = services.HaversineDistanceKm(userLocation.Lat, userLocation.Lon, userLat, userLon)
+		deliveryFee = services.CalcDeliveryFee(distanceKm, 2000)
+	}
 	id, err := services.CreateOrder(ctx, models.CreateOrderInput{
 		UserID:      userID,
 		ChatID:      strconv.FormatInt(chatID, 10),
 		Phone:       phone,
-		Lat:         0,
-		Lon:         0,
-		DistanceKm:  0,
-		DeliveryFee: 0,
+		Lat:         userLat,
+		Lon:         userLon,
+		DistanceKm:  distanceKm,
+		DeliveryFee: deliveryFee,
 		ItemsTotal:  itemsTotal,
+		LocationID:  locationID,
 	})
 	if err != nil {
 		b.send(chatID, "Order failed: "+err.Error())
@@ -819,37 +848,30 @@ func (b *Bot) handleContact(chatID int64, userID int64, phone string) {
 		id, phone, itemsTotal, itemsTotal,
 	))
 
-	// Send order notification to admin
-	b.notifyAdmin(id, phone, items, itemsTotal, userLocation, userLat, userLon, hasUserLocation)
+	// Send order card only to that restaurant's admin (with status buttons)
+	b.notifyAdmin(id, phone, items, itemsTotal, customerUsername, userLocation, userLat, userLon, hasUserLocation)
 }
 
-func (b *Bot) notifyAdmin(orderID int64, phone string, items []cartItem, total int64, location *models.Location, userLat, userLon float64, hasUserLocation bool) {
+func (b *Bot) notifyAdmin(orderID int64, phone string, items []cartItem, total int64, customerUsername string, location *models.Location, userLat, userLon float64, hasUserLocation bool) {
 	if b.messageBot == nil {
 		return // MESSAGE_TOKEN not set or failed to initialize
 	}
 
-	// Build order details text message
-	text := fmt.Sprintf("🆕 Yangi buyurtma #%d\n\n", orderID)
-	text += fmt.Sprintf("📱 Raqam: %s\n\n", phone)
-
-	// Add location references in text (locations will be sent as separate location messages)
-	if hasUserLocation {
-		text += "📍 Foydalanuvchi lokatsiyasi (quyida yuboriladi)\n"
+	// Order card: New Order #id, Customer, Items, Total, Status: NEW
+	customerLabel := "Customer: (no username)"
+	if customerUsername != "" {
+		customerLabel = "Customer: @" + customerUsername
 	}
-	if location != nil {
-		text += fmt.Sprintf("🏪 Filial: %s (quyida yuboriladi)\n", location.Name)
-	}
-	if hasUserLocation || location != nil {
-		text += "\n"
-	}
-
-	text += "🛒 *Savatcha:*\n"
+	text := fmt.Sprintf("New Order #%d\n%s\n\nItems:\n", orderID, customerLabel)
 	for _, it := range items {
-		text += fmt.Sprintf("• %s × %d — %d\n", it.Name, it.Qty, it.Price*int64(it.Qty))
+		text += fmt.Sprintf("- %s x%d\n", it.Name, it.Qty)
 	}
-	text += fmt.Sprintf("\n💵 *Jami: %d*", total)
+	text += fmt.Sprintf("\nTotal: %d UZS\n\nStatus: NEW", total)
 
-	// Get branch admins for the selected location
+	// Buttons for new order: [Start Preparing] [Mark Ready]
+	kb := b.orderStatusKeyboard(orderID, services.OrderStatusNew, nil)
+
+	// Get branch admins for this restaurant only
 	var adminIDs []int64
 	ctx := context.Background()
 	if location != nil {
@@ -858,41 +880,301 @@ func (b *Bot) notifyAdmin(orderID int64, phone string, items []cartItem, total i
 		if err != nil {
 			log.Printf("failed to get branch admins for location %d: %v", location.ID, err)
 		}
-		log.Printf("found %d branch admin(s) for location '%s' (ID: %d)", len(adminIDs), location.Name, location.ID)
 	}
-
-	// If no branch admins found, fall back to main admin
+	if len(adminIDs) == 0 && b.admin != 0 {
+		adminIDs = []int64{b.admin}
+	}
 	if len(adminIDs) == 0 {
-		if b.admin != 0 {
-			adminIDs = []int64{b.admin}
-			log.Printf("no branch admins found, using main admin %d", b.admin)
-		} else {
-			log.Printf("warning: no branch admins found and no main admin set for order #%d", orderID)
-			return
-		}
+		log.Printf("warning: no branch admins for order #%d", orderID)
+		return
 	}
 
-	// Send order details and location to each branch admin
 	for _, adminID := range adminIDs {
-		// Send order details text message
 		msg := tgbotapi.NewMessage(adminID, text)
-		msg.ParseMode = "Markdown"
-		if _, err := b.messageBot.Send(msg); err != nil {
-			log.Printf("failed to send order details to admin %d via MESSAGE_TOKEN: %v", adminID, err)
+		msg.ReplyMarkup = kb
+		sentMsg, err := b.messageBot.Send(msg)
+		if err != nil {
+			log.Printf("failed to send order card to admin %d: %v", adminID, err)
 			continue
 		}
-		log.Printf("successfully sent order details for order #%d to branch admin %d", orderID, adminID)
-
-		// Send user's shared location as a real Telegram location message
+		// Store admin message ID for this order
+		if err := services.SetAdminMessageID(ctx, orderID, adminID, sentMsg.MessageID); err != nil {
+			log.Printf("failed to store admin message ID for order %d: %v", orderID, err)
+		}
 		if hasUserLocation {
 			locMsg := tgbotapi.NewLocation(adminID, userLat, userLon)
-			if _, err := b.messageBot.Send(locMsg); err != nil {
-				log.Printf("failed to send user location to admin %d via MESSAGE_TOKEN: %v", adminID, err)
-			} else {
-				log.Printf("successfully sent user location (%.6f, %.6f) for order #%d to admin %d", userLat, userLon, orderID, adminID)
+			_, _ = b.messageBot.Send(locMsg)
+		}
+	}
+}
+
+// orderStatusKeyboard returns inline buttons for the given order status.
+func (b *Bot) orderStatusKeyboard(orderID int64, status string, deliveryType *string) tgbotapi.InlineKeyboardMarkup {
+	switch status {
+	case services.OrderStatusNew:
+		return tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Start Preparing", "order_status:"+strconv.FormatInt(orderID, 10)+":"+services.OrderStatusPreparing),
+			),
+		)
+	case services.OrderStatusPreparing:
+		return tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Mark Ready", "order_status:"+strconv.FormatInt(orderID, 10)+":"+services.OrderStatusReady),
+			),
+		)
+	case services.OrderStatusReady:
+		// If delivery_type not set, show two options
+		if deliveryType == nil {
+			return tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("Send to Delivery", "delivery_type:"+strconv.FormatInt(orderID, 10)+":delivery"),
+					tgbotapi.NewInlineKeyboardButtonData("Customer Pickup", "delivery_type:"+strconv.FormatInt(orderID, 10)+":pickup"),
+				),
+			)
+		}
+		// If pickup, show Mark Completed
+		if *deliveryType == "pickup" {
+			return tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("Mark Completed", "order_status:"+strconv.FormatInt(orderID, 10)+":"+services.OrderStatusCompleted),
+				),
+			)
+		}
+		// If delivery, no buttons (driver will accept)
+		return tgbotapi.NewInlineKeyboardMarkup()
+	case services.OrderStatusAssigned, services.OrderStatusPickedUp, services.OrderStatusDelivering:
+		return tgbotapi.NewInlineKeyboardMarkup() // No buttons (driver will manage)
+	case services.OrderStatusCompleted:
+		return tgbotapi.NewInlineKeyboardMarkup() // no buttons
+	default:
+		return tgbotapi.NewInlineKeyboardMarkup()
+	}
+}
+
+// startOrderStatusCallbacks runs the message bot update loop to handle order_status callbacks from restaurant admins.
+func (b *Bot) startOrderStatusCallbacks() {
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+	updates := b.messageBot.GetUpdatesChan(u)
+	for update := range updates {
+		if update.CallbackQuery == nil {
+			continue
+		}
+		cq := update.CallbackQuery
+		data := cq.Data
+		if strings.HasPrefix(data, "order_status:") {
+			b.handleOrderStatusCallback(cq)
+		} else if strings.HasPrefix(data, "delivery_type:") {
+			b.handleDeliveryTypeCallback(cq)
+		}
+	}
+}
+
+func (b *Bot) handleOrderStatusCallback(cq *tgbotapi.CallbackQuery) {
+	parts := strings.SplitN(cq.Data, ":", 3)
+	if len(parts) != 3 {
+		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "Invalid callback."))
+		return
+	}
+	orderID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || orderID <= 0 {
+		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "Invalid order."))
+		return
+	}
+	newStatus := parts[2]
+	adminUserID := cq.From.ID
+
+	ctx := context.Background()
+	adminLocID, err := services.GetAdminLocationID(ctx, adminUserID)
+	if err != nil || adminLocID == 0 {
+		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "Unauthorized."))
+		return
+	}
+
+	err = services.UpdateOrderStatus(ctx, orderID, newStatus, adminLocID, adminUserID)
+	if err != nil {
+		// 403 / 400: return error to admin via callback
+		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, err.Error()))
+		log.Printf("order status update failed: order=%d status=%s admin=%d: %v", orderID, newStatus, adminUserID, err)
+		return
+	}
+	b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "✅ Status updated."))
+
+	// Edit admin message: replace Status line and update keyboard
+	statusLabel := strings.ToUpper(newStatus)
+	if newStatus == services.OrderStatusNew {
+		statusLabel = "NEW"
+	}
+	newText := replaceOrderStatusInMessage(cq.Message.Text, statusLabel)
+	// Get order to check delivery_type
+	o, _ := services.GetOrder(ctx, orderID)
+	var deliveryType *string
+	if o != nil {
+		deliveryType = o.DeliveryType
+	}
+	kb := b.orderStatusKeyboard(orderID, newStatus, deliveryType)
+	edit := tgbotapi.NewEditMessageText(cq.Message.Chat.ID, cq.Message.MessageID, newText)
+	// Only set ReplyMarkup if keyboard has buttons (Telegram doesn't accept empty keyboards)
+	if len(kb.InlineKeyboard) > 0 {
+		edit.ReplyMarkup = &kb
+		if _, err := b.messageBot.Send(edit); err != nil {
+			log.Printf("edit order message: %v", err)
+		}
+	} else {
+		// Remove keyboard by editing with explicitly empty keyboard array
+		emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
+		editRemoveKb := tgbotapi.NewEditMessageReplyMarkup(cq.Message.Chat.ID, cq.Message.MessageID, emptyKb)
+		if _, err := b.messageBot.Send(editRemoveKb); err != nil {
+			log.Printf("remove keyboard from order message: %v", err)
+		}
+		// Then send text edit without keyboard
+		if _, err := b.messageBot.Send(edit); err != nil {
+			log.Printf("edit order message: %v", err)
+		}
+	}
+
+	// Notify customer (preparing / ready / completed) after DB commit; de-dup within 30s
+	if newStatus == services.OrderStatusPreparing || newStatus == services.OrderStatusReady || newStatus == services.OrderStatusCompleted {
+		o, _ := services.GetOrder(ctx, orderID)
+		if o != nil && o.ChatID != "" {
+			skip, _ := services.SentOrderStatusNotifyWithin30s(ctx, orderID, newStatus)
+			if !skip {
+				text := services.CustomerMessageForOrderStatus(o, newStatus)
+				if chatID, err := strconv.ParseInt(o.ChatID, 10, 64); err == nil {
+					msg := tgbotapi.NewMessage(chatID, text)
+					if _, sendErr := b.api.Send(msg); sendErr != nil {
+						log.Printf("send customer order status notify: %v", sendErr)
+					} else {
+						_ = services.SaveOutboundMessage(ctx, chatID, text, map[string]interface{}{
+							"channel":    "telegram",
+							"sent_via":   "order_status_notify",
+							"order_id":   orderID,
+							"status":     newStatus,
+						})
+					}
+				}
 			}
 		}
 	}
+}
+
+func (b *Bot) handleDeliveryTypeCallback(cq *tgbotapi.CallbackQuery) {
+	parts := strings.SplitN(cq.Data, ":", 3)
+	if len(parts) != 3 {
+		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "Invalid callback."))
+		return
+	}
+	orderID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || orderID <= 0 {
+		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "Invalid order."))
+		return
+	}
+	deliveryType := parts[2]
+	if deliveryType != "pickup" && deliveryType != "delivery" {
+		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "Invalid delivery type."))
+		return
+	}
+	adminUserID := cq.From.ID
+
+	ctx := context.Background()
+	adminLocID, err := services.GetAdminLocationID(ctx, adminUserID)
+	if err != nil || adminLocID == 0 {
+		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "Unauthorized."))
+		return
+	}
+
+	err = services.SetDeliveryType(ctx, orderID, deliveryType, adminLocID)
+	if err != nil {
+		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, err.Error()))
+		log.Printf("set delivery type failed: order=%d type=%s admin=%d: %v", orderID, deliveryType, adminUserID, err)
+		return
+	}
+
+	var msgText string
+	if deliveryType == "pickup" {
+		msgText = "✅ Buyurtma mijoz o'zi olib ketish uchun belgilandi.\n\nEndi \"Mark Completed\" tugmasini bosing."
+		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "✅ Customer Pickup selected."))
+	} else {
+		msgText = "✅ Buyurtma driverga uzatildi, driver qabul qilishi kutilmoqda."
+		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "✅ Sent to Delivery."))
+		// Log order details for debugging driver visibility
+		o, _ := services.GetOrder(ctx, orderID)
+		if o != nil {
+			var lat, lon float64
+			var hasLocation bool
+			err := db.Pool.QueryRow(ctx, `SELECT lat, lon FROM orders WHERE id = $1`, orderID).Scan(&lat, &lon)
+			if err == nil {
+				hasLocation = lat != 0 && lon != 0
+			}
+			log.Printf("order sent to delivery: order_id=%d status=%s delivery_type=%s has_location=%v lat=%.6f lon=%.6f driver_visible=%v", 
+				orderID, o.Status, deliveryType, hasLocation, lat, lon, hasLocation)
+		}
+	}
+
+	// Edit admin message: update keyboard
+	o, _ := services.GetOrder(ctx, orderID)
+	if o == nil {
+		return
+	}
+	deliveryTypePtr := &deliveryType
+	kb := b.orderStatusKeyboard(orderID, o.Status, deliveryTypePtr)
+	edit := tgbotapi.NewEditMessageText(cq.Message.Chat.ID, cq.Message.MessageID, cq.Message.Text+"\n\n"+msgText)
+	// Only set ReplyMarkup if keyboard has buttons (Telegram doesn't accept empty keyboards)
+	if len(kb.InlineKeyboard) > 0 {
+		edit.ReplyMarkup = &kb
+		if _, err := b.messageBot.Send(edit); err != nil {
+			log.Printf("edit order message: %v", err)
+		}
+	} else {
+		// Remove keyboard by editing with explicitly empty keyboard array
+		emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
+		editRemoveKb := tgbotapi.NewEditMessageReplyMarkup(cq.Message.Chat.ID, cq.Message.MessageID, emptyKb)
+		if _, err := b.messageBot.Send(editRemoveKb); err != nil {
+			log.Printf("remove keyboard from order message: %v", err)
+		}
+		// Then send text edit without keyboard
+		if _, err := b.messageBot.Send(edit); err != nil {
+			log.Printf("edit order message: %v", err)
+		}
+	}
+
+	// If pickup, notify customer immediately
+	if deliveryType == "pickup" {
+		o, _ := services.GetOrder(ctx, orderID)
+		if o != nil && o.ChatID != "" {
+			skip, _ := services.SentOrderStatusNotifyWithin30s(ctx, orderID, services.OrderStatusReady)
+			if !skip {
+				text := services.CustomerMessageForOrderStatus(o, services.OrderStatusReady)
+				if chatID, err := strconv.ParseInt(o.ChatID, 10, 64); err == nil {
+					msg := tgbotapi.NewMessage(chatID, text)
+					if _, sendErr := b.api.Send(msg); sendErr != nil {
+						log.Printf("send customer order status notify: %v", sendErr)
+					} else {
+						_ = services.SaveOutboundMessage(ctx, chatID, text, map[string]interface{}{
+							"channel":    "telegram",
+							"sent_via":   "order_status_notify",
+							"order_id":   orderID,
+							"status":     services.OrderStatusReady,
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func replaceOrderStatusInMessage(text, newStatusLabel string) string {
+	const prefix = "Status: "
+	start := strings.Index(text, prefix)
+	if start == -1 {
+		return text + "\n\nStatus: " + newStatusLabel
+	}
+	end := start + len(prefix)
+	for end < len(text) && text[end] != '\n' {
+		end++
+	}
+	return text[:start] + prefix + newStatusLabel + text[end:]
 }
 
 func (b *Bot) removeKeyboard(chatID int64, text string) {
@@ -971,9 +1253,10 @@ func (b *Bot) handlePromote(chatID int64, userID int64, text string) {
 	}
 
 	parts := strings.Fields(text)
-	if len(parts) < 3 {
-		b.send(chatID, "📝 Usage: /promote <branch_location_id> <new_admin_user_id>\n\n"+
-			"Example: /promote 1 123456789\n\n"+
+	if len(parts) < 4 {
+		b.send(chatID, "📝 Usage: /promote <branch_location_id> <new_admin_user_id> <password>\n\n"+
+			"Example: /promote 1 123456789 MyUniquePass123\n\n"+
+			"The password must be unique (not used by any other branch admin). The new admin will use it to log in to the adder bot.\n\n"+
 			"💡 To get a user's ID, ask them to use @userinfobot on Telegram.")
 		return
 	}
@@ -993,8 +1276,20 @@ func (b *Bot) handlePromote(chatID int64, userID int64, text string) {
 		return
 	}
 
+	password := strings.TrimSpace(strings.Join(parts[3:], " "))
+	if password == "" {
+		b.send(chatID, "❌ Password cannot be empty.")
+		return
+	}
+
+	passwordHash, err := services.HashBranchAdminPassword(password)
+	if err != nil {
+		b.send(chatID, "❌ Failed to set password: "+err.Error())
+		return
+	}
+
 	ctx := context.Background()
-	err = services.AddBranchAdmin(ctx, branchLocationID, newAdminID, userID)
+	err = services.AddBranchAdmin(ctx, branchLocationID, newAdminID, userID, passwordHash)
 	if err != nil {
 		b.send(chatID, "❌ Failed to promote admin: "+err.Error())
 		log.Printf("failed to promote admin %d for branch %d by admin %d: %v", newAdminID, branchLocationID, userID, err)

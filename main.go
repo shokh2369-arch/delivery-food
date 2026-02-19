@@ -54,15 +54,26 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start adder bot (ADDER_TOKEN + LOGIN) in background if configured
+	// Start adder bot (ADDER_TOKEN): big admin uses LOGIN; branch admins use their unique password
 	if cfg.Telegram.AdderToken != "" {
-		adder, err := bot.NewAdderBot(cfg)
+		adder, err := bot.NewAdderBot(cfg, adminID)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "adder bot:", err)
 			os.Exit(1)
 		}
 		go adder.Start()
 		fmt.Println("Qo'shuvchi bot ishga tushdi.")
+	}
+
+	// Start driver bot (DRIVER_BOT_TOKEN)
+	if cfg.Telegram.DriverToken != "" {
+		driverBot, err := bot.NewDriverBot(cfg, b.GetAPI(), b.GetMessageBot())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "driver bot:", err)
+			os.Exit(1)
+		}
+		go driverBot.Start()
+		fmt.Println("Yetkazib beruvchi bot ishga tushdi.")
 	}
 
 	fmt.Println("Bot started.")

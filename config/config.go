@@ -25,11 +25,13 @@ type TelegramConfig struct {
 	Token       string
 	AdderToken  string
 	MessageToken string // token for sending order notifications to admin
+	DriverToken string // token for driver bot
 	Login       string // admin password for adder bot
 }
 
 type DeliveryConfig struct {
-	RatePerKm int64
+	RatePerKm        int64
+	DriverJobsRadius float64 // radius in km for driver jobs search
 }
 
 func Load() (*Config, error) {
@@ -49,10 +51,12 @@ func Load() (*Config, error) {
 			Token:        getEnv("TOKEN", ""),
 			AdderToken:   getEnv("ADDER_TOKEN", ""),
 			MessageToken: getEnv("MESSAGE_TOKEN", ""),
+			DriverToken:  getEnv("DRIVER_BOT_TOKEN", ""),
 			Login:        getEnv("LOGIN", ""),
 		},
 		Delivery: DeliveryConfig{
-			RatePerKm: 2000,
+			RatePerKm:        2000,
+			DriverJobsRadius: getDriverJobsRadius(),
 		},
 	}, nil
 }
@@ -62,4 +66,14 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func getDriverJobsRadius() float64 {
+	if v := os.Getenv("DRIVER_JOBS_RADIUS_KM"); v != "" {
+		if radius, err := strconv.ParseFloat(v, 64); err == nil && radius > 0 {
+			return radius
+		}
+	}
+	// Default 50km for debugging
+	return 50.0
 }

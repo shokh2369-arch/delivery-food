@@ -30,7 +30,8 @@ type TelegramConfig struct {
 }
 
 type DeliveryConfig struct {
-	RatePerKm        int64
+	BaseFee          int64   // start price (e.g. 5000 sum)
+	RatePerKm        int64   // per km (e.g. 4000 sum)
 	DriverJobsRadius float64 // radius in km for driver jobs search
 }
 
@@ -55,7 +56,8 @@ func Load() (*Config, error) {
 			Login:        getEnv("LOGIN", ""),
 		},
 		Delivery: DeliveryConfig{
-			RatePerKm:        2000,
+			BaseFee:          getBaseFee(),   // 5000 sum start
+			RatePerKm:        getRatePerKm(), // 4000 sum per km
 			DriverJobsRadius: getDriverJobsRadius(),
 		},
 	}, nil
@@ -66,6 +68,24 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func getBaseFee() int64 {
+	if v := os.Getenv("DELIVERY_BASE_FEE"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 5000 // 5000 sum start price
+}
+
+func getRatePerKm() int64 {
+	if v := os.Getenv("RATE_PER_KM"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 4000 // 4000 sum per km
 }
 
 func getDriverJobsRadius() float64 {

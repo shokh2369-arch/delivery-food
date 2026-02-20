@@ -8,8 +8,8 @@ import (
 )
 
 // CreateLocationWithAdmin atomically creates a new location and assigns a branch admin with password.
-// If assigning the admin fails, the location will NOT be created.
-func CreateLocationWithAdmin(ctx context.Context, name string, lat, lon float64, adminUserID int64, promotedBy int64, passwordHash string) (int64, error) {
+// orderLang is the language the admin receives order cards in: "uz" or "ru" (default "uz" if empty).
+func CreateLocationWithAdmin(ctx context.Context, name string, lat, lon float64, adminUserID int64, promotedBy int64, passwordHash string, orderLang string) (int64, error) {
 	if adminUserID <= 0 {
 		return 0, fmt.Errorf("adminUserID must be positive")
 	}
@@ -18,6 +18,9 @@ func CreateLocationWithAdmin(ctx context.Context, name string, lat, lon float64,
 	}
 	if passwordHash == "" {
 		return 0, fmt.Errorf("password is required for branch admin")
+	}
+	if orderLang != "ru" {
+		orderLang = "uz"
 	}
 
 	// Safety net: ensure table exists before trying to insert.
@@ -52,9 +55,9 @@ func CreateLocationWithAdmin(ctx context.Context, name string, lat, lon float64,
 	}
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO branch_admins (branch_location_id, branch_name, admin_user_id, promoted_by, password_hash)
-		VALUES ($1, $2, $3, $4, $5)`,
-		locationID, name, adminUserID, promotedBy, passwordHash,
+		INSERT INTO branch_admins (branch_location_id, branch_name, admin_user_id, promoted_by, password_hash, order_lang)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		locationID, name, adminUserID, promotedBy, passwordHash, orderLang,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert branch admin: %w", err)

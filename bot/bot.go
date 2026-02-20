@@ -11,6 +11,7 @@ import (
 
 	"food-telegram/config"
 	"food-telegram/db"
+	"food-telegram/lang"
 	"food-telegram/models"
 	"food-telegram/services"
 
@@ -103,8 +104,11 @@ type Bot struct {
 	locSuggestions   map[int64][]services.LocationWithDistance
 	locSuggestionsMu sync.RWMutex
 
-	userSharedCoords   map[int64]struct{ Lat, Lon float64 } // Store user's shared location coordinates
+	userSharedCoords   map[int64]struct{ Lat, Lon float64 }
 	userSharedCoordsMu sync.RWMutex
+
+	userLang   map[int64]string // "uz" or "ru"
+	userLangMu sync.RWMutex
 }
 
 func New(cfg *config.Config, adminUserID int64) (*Bot, error) {
@@ -118,6 +122,7 @@ func New(cfg *config.Config, adminUserID int64) (*Bot, error) {
 		admin:            adminUserID,
 		locSuggestions:   make(map[int64][]services.LocationWithDistance),
 		userSharedCoords: make(map[int64]struct{ Lat, Lon float64 }),
+		userLang:         make(map[int64]string),
 	}
 	// Initialize message bot if MESSAGE_TOKEN is set
 	if cfg.Telegram.MessageToken != "" {
@@ -171,13 +176,12 @@ func (b *Bot) Start() {
 		case text == "/start":
 			b.handleStart(msg.Chat.ID, userID)
 		case text == "/menu":
-			// Check if user has shared location before showing menu
 			b.userSharedCoordsMu.RLock()
 			_, hasLocation := b.userSharedCoords[userID]
 			b.userSharedCoordsMu.RUnlock()
 			if !hasLocation {
-				b.send(msg.Chat.ID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
-				b.handleStart(msg.Chat.ID, userID)
+				b.sendLang(msg.Chat.ID, userID, "please_share_loc")
+				b.showWelcomeWithLocation(msg.Chat.ID, userID, b.getLang(userID))
 			} else {
 				b.sendMenu(msg.Chat.ID, userID)
 			}
@@ -208,6 +212,31 @@ func (b *Bot) send(chatID int64, text string) {
 	}
 }
 
+func (b *Bot) getLang(userID int64) string {
+	b.userLangMu.RLock()
+	defer b.userLangMu.RUnlock()
+	l := b.userLang[userID]
+	// Return "" if user has not chosen a language yet (so /start shows language selection)
+	if l == "" || (l != lang.Uz && l != lang.Ru) {
+		return ""
+	}
+	return l
+}
+
+func (b *Bot) setLang(userID int64, langCode string) {
+	if langCode != lang.Uz && langCode != lang.Ru {
+		return
+	}
+	b.userLangMu.Lock()
+	defer b.userLangMu.Unlock()
+	b.userLang[userID] = langCode
+}
+
+func (b *Bot) sendLang(chatID int64, userID int64, key string, args ...interface{}) {
+	text := lang.T(b.getLang(userID), key, args...)
+	b.send(chatID, text)
+}
+
 func (b *Bot) sendWithInline(chatID int64, text string, kb tgbotapi.InlineKeyboardMarkup) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ReplyMarkup = kb
@@ -217,35 +246,51 @@ func (b *Bot) sendWithInline(chatID int64, text string, kb tgbotapi.InlineKeyboa
 }
 
 func (b *Bot) handleStart(chatID int64, userID int64) {
-	// Require location sharing before proceeding
-	kb := tgbotapi.NewReplyKeyboard(
-		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButtonLocation("📍 Lokatsiyani ulashish"),
+	// Always show language selection on /start
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("O'zbek", "lang:uz"),
+			tgbotapi.NewInlineKeyboardButtonData("Русский", "lang:ru"),
 		),
 	)
-	kb.OneTimeKeyboard = true
-	kb.ResizeKeyboard = true
-
-	msg := tgbotapi.NewMessage(chatID, "Xush kelibsiz! Buyurtma berish uchun lokatsiyangizni ulashing. Iltimos, \"📍 Lokatsiyani ulashish\" tugmasini bosing.")
+	msg := tgbotapi.NewMessage(chatID, lang.T(lang.Uz, "choose_lang_both"))
 	msg.ReplyMarkup = kb
 	if _, err := b.api.Send(msg); err != nil {
 		log.Printf("send error: %v", err)
 	}
 }
 
-func (b *Bot) categoryKeyboard() tgbotapi.InlineKeyboardMarkup {
+// showWelcomeWithLocation shows welcome message and location keyboard in the given language (after user chose lang).
+func (b *Bot) showWelcomeWithLocation(chatID int64, userID int64, langCode string) {
+	b.setLang(userID, langCode)
+	l := b.getLang(userID)
+	kb := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButtonLocation(lang.T(l, "share_location")),
+		),
+	)
+	kb.OneTimeKeyboard = true
+	kb.ResizeKeyboard = true
+	msg := tgbotapi.NewMessage(chatID, lang.T(l, "welcome"))
+	msg.ReplyMarkup = kb
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("send error: %v", err)
+	}
+}
+
+func (b *Bot) categoryKeyboard(langCode string) tgbotapi.InlineKeyboardMarkup {
 	rows := [][]tgbotapi.InlineKeyboardButton{
 		{
-			tgbotapi.NewInlineKeyboardButtonData("🍽 Yeguliklar", "cat:food"),
-			tgbotapi.NewInlineKeyboardButtonData("🥤 Ichimliklar", "cat:drink"),
-			tgbotapi.NewInlineKeyboardButtonData("🍰 Kekslar", "cat:dessert"),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(langCode, "cat_food"), "cat:food"),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(langCode, "cat_drink"), "cat:drink"),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(langCode, "cat_dessert"), "cat:dessert"),
 		},
-		{tgbotapi.NewInlineKeyboardButtonData("« Back", "back")},
+		{tgbotapi.NewInlineKeyboardButtonData(lang.T(langCode, "back"), "back")},
 	}
 	return tgbotapi.NewInlineKeyboardMarkup(rows...)
 }
 
-func (b *Bot) menuKeyboard(userID int64, category string) tgbotapi.InlineKeyboardMarkup {
+func (b *Bot) menuKeyboard(userID int64, category string, langCode string) tgbotapi.InlineKeyboardMarkup {
 	ctx := context.Background()
 	var items []models.MenuItem
 	// Try to load user's selected location; if not found, fall back to global menu
@@ -278,74 +323,72 @@ func (b *Bot) menuKeyboard(userID int64, category string) tgbotapi.InlineKeyboar
 
 	if cart != nil && len(cart.Items) > 0 {
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("✅ Confirm order", "confirm"),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(langCode, "confirm_order"), "confirm"),
 		))
 	}
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("« Back to categories", "back_cats"),
+		tgbotapi.NewInlineKeyboardButtonData(lang.T(langCode, "back_cats"), "back_cats"),
 	))
 
 	return tgbotapi.NewInlineKeyboardMarkup(rows...)
 }
 
 func (b *Bot) sendMenu(chatID int64, userID int64) {
-	// Verify user has shared location
 	b.userSharedCoordsMu.RLock()
 	_, hasLocation := b.userSharedCoords[userID]
 	b.userSharedCoordsMu.RUnlock()
 	if !hasLocation {
-		b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
-		b.handleStart(chatID, userID)
+		b.sendLang(chatID, userID, "please_share_loc")
+		b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
 		return
 	}
-
+	l := b.getLang(userID)
 	ctx := context.Background()
 	cart, _ := b.getCart(ctx, userID)
 
-	text := "📋 *Menu*\n\nKategoriyani tanlang: Yeguliklar, Ichimliklar yoki Kekslar."
+	text := lang.T(l, "menu_header")
 	if cart != nil && len(cart.Items) > 0 {
-		text += "\n\n🛒 *Savatchangiz:*\n"
+		text += "\n\n🛒 *" + lang.T(l, "cart_label") + ":*\n"
 		for _, it := range cart.Items {
 			text += fmt.Sprintf("• %s × %d — %d\n", it.Name, it.Qty, it.Price*int64(it.Qty))
 		}
-		text += fmt.Sprintf("\n*Jami: %d*", cart.ItemsTotal)
+		text += fmt.Sprintf("\n*%s: %d*", lang.T(l, "jami"), cart.ItemsTotal)
 	}
 
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "Markdown"
-	msg.ReplyMarkup = b.categoryKeyboard()
+	msg.ReplyMarkup = b.categoryKeyboard(l)
 	if _, err := b.api.Send(msg); err != nil {
 		log.Printf("send error: %v", err)
 	}
 }
 
 func (b *Bot) sendCategoryMenu(chatID int64, userID int64, category string) {
-	// Verify user has shared location
 	b.userSharedCoordsMu.RLock()
 	_, hasLocation := b.userSharedCoords[userID]
 	b.userSharedCoordsMu.RUnlock()
 	if !hasLocation {
-		b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
-		b.handleStart(chatID, userID)
+		b.sendLang(chatID, userID, "please_share_loc")
+		b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
 		return
 	}
-
+	l := b.getLang(userID)
 	ctx := context.Background()
 	cart, _ := b.getCart(ctx, userID)
 
-	catLabel := map[string]string{"food": "Yeguliklar", "drink": "Ichimliklar", "dessert": "Kekslar"}[category]
-	text := fmt.Sprintf("📋 *%s*\n\nBu kategoriyadagi maxsulotlarni tanlang.", catLabel)
+	catLabel := map[string]string{"food": lang.T(l, "cat_food_label"), "drink": lang.T(l, "cat_drink_label"), "dessert": lang.T(l, "cat_dessert_label")}[category]
+	text := fmt.Sprintf("📋 *%s*\n\n%s", catLabel, lang.T(l, "category_choose"))
 	if cart != nil && len(cart.Items) > 0 {
-		text += "\n\n🛒 *Savatchangiz:*\n"
+		text += "\n\n🛒 *" + lang.T(l, "cart_label") + ":*\n"
 		for _, it := range cart.Items {
 			text += fmt.Sprintf("• %s × %d — %d\n", it.Name, it.Qty, it.Price*int64(it.Qty))
 		}
-		text += fmt.Sprintf("\n*Jami: %d*", cart.ItemsTotal)
+		text += fmt.Sprintf("\n*%s: %d*", lang.T(l, "jami"), cart.ItemsTotal)
 	}
 
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "Markdown"
-	msg.ReplyMarkup = b.menuKeyboard(userID, category)
+	msg.ReplyMarkup = b.menuKeyboard(userID, category, l)
 	if _, err := b.api.Send(msg); err != nil {
 		log.Printf("send error: %v", err)
 	}
@@ -359,14 +402,17 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 	b.api.Request(tgbotapi.NewCallback(cq.ID, ""))
 
 	switch {
+	case data == "lang:uz" || data == "lang:ru":
+		langCode := strings.TrimPrefix(data, "lang:")
+		b.showWelcomeWithLocation(chatID, userID, langCode)
 	case data == "menu":
 		// Check if user has shared location before showing menu
 		b.userSharedCoordsMu.RLock()
 		_, hasLocation := b.userSharedCoords[userID]
 		b.userSharedCoordsMu.RUnlock()
 		if !hasLocation {
-			b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
-			b.handleStart(chatID, userID)
+			b.sendLang(chatID, userID, "please_share_loc")
+			b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
 		} else {
 			b.sendMenu(chatID, userID)
 		}
@@ -375,19 +421,19 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		idStr := strings.TrimPrefix(data, "locsel:")
 		locID, err := strconv.ParseInt(idStr, 10, 64)
 		if err != nil || locID <= 0 {
-			b.send(chatID, "Noto'g'ri filial tanlandi.")
+			b.sendLang(chatID, userID, "wrong_branch")
 			return
 		}
 		ctx := context.Background()
 		if err := services.SetUserLocation(ctx, userID, locID); err != nil {
-			b.send(chatID, "Filialni saqlashda xatolik yuz berdi.")
+			b.sendLang(chatID, userID, "branch_save_err")
 			return
 		}
-		// Confirm selection and show button to open menu for this location
-		msgText := "✅ Filial tanlandi. Endi menyuni ko'rishingiz mumkin."
+		l := b.getLang(userID)
+		msgText := lang.T(l, "branch_selected")
 		kb := tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("📋Menyuni ko'rish", "menu"),
+				tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "view_menu"), "menu"),
 			),
 		)
 		b.sendWithInline(chatID, msgText, kb)
@@ -410,15 +456,15 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 	case data == "loc:menu":
 		b.sendMenu(chatID, userID)
 	case data == "back":
-		b.handleStart(chatID, userID)
+		b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
 	case data == "back_cats":
 		// Check location before showing menu
 		b.userSharedCoordsMu.RLock()
 		_, hasLocation := b.userSharedCoords[userID]
 		b.userSharedCoordsMu.RUnlock()
 		if !hasLocation {
-			b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
-			b.handleStart(chatID, userID)
+			b.sendLang(chatID, userID, "please_share_loc")
+			b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
 		} else {
 			b.sendMenu(chatID, userID)
 		}
@@ -428,8 +474,8 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		_, hasLocation := b.userSharedCoords[userID]
 		b.userSharedCoordsMu.RUnlock()
 		if !hasLocation {
-			b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
-			b.handleStart(chatID, userID)
+			b.sendLang(chatID, userID, "please_share_loc")
+			b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
 		} else {
 			b.sendCategoryMenu(chatID, userID, strings.TrimPrefix(data, "cat:"))
 		}
@@ -446,14 +492,16 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		b.sendSuggestionScreen(chatID, userID)
 	case data == "confirm_final":
 		b.requestPhone(chatID, userID)
+	case data == "confirm_reject":
+		b.sendMenu(chatID, userID)
 	case strings.HasPrefix(data, "suggest:"):
 		// Check location before showing suggestions
 		b.userSharedCoordsMu.RLock()
 		_, hasLocation := b.userSharedCoords[userID]
 		b.userSharedCoordsMu.RUnlock()
 		if !hasLocation {
-			b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
-			b.handleStart(chatID, userID)
+			b.sendLang(chatID, userID, "please_share_loc")
+			b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
 		} else {
 			cat := strings.TrimPrefix(data, "suggest:")
 			if cat == "food" || cat == "drink" || cat == "dessert" {
@@ -464,13 +512,12 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 }
 
 func (b *Bot) addToCart(chatID int64, userID int64, itemID string, category string, editMsgID int) {
-	// Verify user has shared location before adding to cart
 	b.userSharedCoordsMu.RLock()
 	_, hasLocation := b.userSharedCoords[userID]
 	b.userSharedCoordsMu.RUnlock()
 	if !hasLocation {
-		b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
-		b.handleStart(chatID, userID)
+		b.sendLang(chatID, userID, "please_share_loc")
+		b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
 		return
 	}
 
@@ -500,41 +547,62 @@ func (b *Bot) addToCart(chatID int64, userID int64, itemID string, category stri
 		log.Printf("failed to save cart: %v", err)
 	}
 
-	catLabel := map[string]string{"food": "Yeguliklar", "drink": "Ichimliklar", "dessert": "Kekslar"}[category]
-	text := fmt.Sprintf("📋 *%s*\n\nMaxsulot qo'shildi.\n\n🛒 *Savatchangiz:*\n", catLabel)
+	l := b.getLang(userID)
+	catLabel := map[string]string{"food": lang.T(l, "cat_food_label"), "drink": lang.T(l, "cat_drink_label"), "dessert": lang.T(l, "cat_dessert_label")}[category]
+	text := fmt.Sprintf("📋 *%s*\n\n%s\n\n🛒 *%s:*\n", catLabel, lang.T(l, "product_added"), lang.T(l, "cart_label"))
 	for _, it := range cart.Items {
 		text += fmt.Sprintf("• %s × %d — %d\n", it.Name, it.Qty, it.Price*int64(it.Qty))
 	}
-	text += fmt.Sprintf("\n*Jami: %d*\n\nBuyurtmani tasdiqlash uchun *Tasdiqlash* tugmasini bosing.", cart.ItemsTotal)
+	text += fmt.Sprintf("\n*%s: %d*\n\n%s", lang.T(l, "jami"), cart.ItemsTotal, lang.T(l, "confirm_prompt"))
 
 	edit := tgbotapi.NewEditMessageText(chatID, editMsgID, text)
 	edit.ParseMode = "Markdown"
-	edit.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: b.menuKeyboard(userID, category).InlineKeyboard}
+	edit.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: b.menuKeyboard(userID, category, l).InlineKeyboard}
 	if _, err := b.api.Send(edit); err != nil {
 		log.Printf("edit error: %v", err)
 	}
 }
 
-// sendSuggestionScreen shows "Add something more?" with inline: missing categories (Drinks, Desserts, Foods) + Confirm order.
+// sendSuggestionScreen shows cart, delivery fee (0 or 1000 by rule), grand total; user can Accept (Tasdiqlash) or Reject (Bekor).
 func (b *Bot) sendSuggestionScreen(chatID int64, userID int64) {
-	// Verify user has shared location
 	b.userSharedCoordsMu.RLock()
 	_, hasLocation := b.userSharedCoords[userID]
 	b.userSharedCoordsMu.RUnlock()
 	if !hasLocation {
-		b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
-		b.handleStart(chatID, userID)
+		b.sendLang(chatID, userID, "please_share_loc")
+		b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
 		return
 	}
-
+	l := b.getLang(userID)
 	ctx := context.Background()
 	cart, err := b.getCart(ctx, userID)
 	if err != nil || cart == nil || len(cart.Items) == 0 {
-		b.send(chatID, "Sizning savatchangiz bo'sh. Iltimos, avval buyurtma qo'shing.")
-		b.handleStart(chatID, userID)
+		b.sendLang(chatID, userID, "cart_empty")
+		b.showWelcomeWithLocation(chatID, userID, l)
 		return
 	}
-	// Which categories are already in the cart?
+
+	// Compute delivery fee: distance from branch to user, then apply rule (< 500 -> 0, >= 500 -> 1000)
+	var deliveryFee int64
+	userLocation, _ := services.GetUserLocation(ctx, userID)
+	b.userSharedCoordsMu.RLock()
+	coords, hasCoords := b.userSharedCoords[userID]
+	b.userSharedCoordsMu.RUnlock()
+	if userLocation != nil && hasCoords {
+		distanceKm := services.HaversineDistanceKm(userLocation.Lat, userLocation.Lon, coords.Lat, coords.Lon)
+		baseFee := b.cfg.Delivery.BaseFee
+		if baseFee < 0 {
+			baseFee = 5000
+		}
+		ratePerKm := b.cfg.Delivery.RatePerKm
+		if ratePerKm <= 0 {
+			ratePerKm = 4000
+		}
+		rawFee := services.CalcDeliveryFee(distanceKm, baseFee, ratePerKm)
+		deliveryFee = services.ApplyDeliveryFeeRule(rawFee)
+	}
+	grandTotal := cart.ItemsTotal + deliveryFee
+
 	hasCategory := map[string]bool{}
 	for _, it := range cart.Items {
 		if it.Category != "" {
@@ -544,22 +612,24 @@ func (b *Bot) sendSuggestionScreen(chatID int64, userID int64) {
 
 	var row []tgbotapi.InlineKeyboardButton
 	if !hasCategory["drink"] {
-		row = append(row, tgbotapi.NewInlineKeyboardButtonData("🥤 Ichimliklar", "suggest:drink"))
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "cat_drink"), "suggest:drink"))
 	}
 	if !hasCategory["dessert"] {
-		row = append(row, tgbotapi.NewInlineKeyboardButtonData("🍰 Kekslar", "suggest:dessert"))
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "cat_dessert"), "suggest:dessert"))
 	}
 	if !hasCategory["food"] {
-		row = append(row, tgbotapi.NewInlineKeyboardButtonData("🍽 Yeguliklar", "suggest:food"))
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "cat_food"), "suggest:food"))
 	}
-	row = append(row, tgbotapi.NewInlineKeyboardButtonData("✅ Buyurtmani tasdiqlash", "confirm_final"))
+	row = append(row, tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "accept_confirm"), "confirm_final"))
+	row = append(row, tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "reject_cancel"), "confirm_reject"))
 
 	kb := tgbotapi.NewInlineKeyboardMarkup(row)
-	text := "🛒 *Your order*\n\n"
+	text := lang.T(l, "your_order") + "\n\n"
 	for _, it := range cart.Items {
 		text += fmt.Sprintf("• %s × %d — %d\n", it.Name, it.Qty, it.Price*int64(it.Qty))
 	}
-	text += fmt.Sprintf("\n*Jami: %d*\n\nYana narsa qo'shish yoki buyurtmani tasdiqlash.", cart.ItemsTotal)
+	text += fmt.Sprintf("\n*%s: %d*\n", lang.T(l, "jami"), cart.ItemsTotal)
+	text += fmt.Sprintf("\n*%s*\n\n%s", lang.T(l, "grand_total_label", grandTotal), lang.T(l, "add_more_confirm"))
 
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "Markdown"
@@ -570,20 +640,19 @@ func (b *Bot) sendSuggestionScreen(chatID int64, userID int64) {
 }
 
 func (b *Bot) requestPhone(chatID int64, userID int64) {
-	// Verify user has shared location before requesting phone
 	b.userSharedCoordsMu.RLock()
 	_, hasLocation := b.userSharedCoords[userID]
 	b.userSharedCoordsMu.RUnlock()
 	if !hasLocation {
-		b.send(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
-		b.handleStart(chatID, userID)
+		b.sendLang(chatID, userID, "please_share_loc")
+		b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
 		return
 	}
-
+	l := b.getLang(userID)
 	ctx := context.Background()
 	cart, err := b.getCart(ctx, userID)
 	if err != nil || cart == nil || len(cart.Items) == 0 {
-		b.send(chatID, "Sizning savatchangiz bo'sh. Iltimos, avval buyurtma qo'shing.")
+		b.sendLang(chatID, userID, "cart_empty")
 		return
 	}
 	// Copy cart into checkout
@@ -603,31 +672,29 @@ func (b *Bot) requestPhone(chatID int64, userID int64) {
 
 	kb := tgbotapi.NewReplyKeyboard(
 		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButtonContact("📱Raqamingizni ulashish"),
+			tgbotapi.NewKeyboardButtonContact(lang.T(l, "share_phone")),
 		),
 	)
 	kb.OneTimeKeyboard = true
 	kb.ResizeKeyboard = true
 
-	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🛒 Buyurtma jami: %d\n\n📱 Iltimos, raqamingizni ulashing.", checkout.ItemsTotal))
+	msg := tgbotapi.NewMessage(chatID, lang.T(l, "request_phone", checkout.ItemsTotal))
 	msg.ReplyMarkup = kb
 	if _, err := b.api.Send(msg); err != nil {
 		log.Printf("send error: %v", err)
 	}
 }
 
-// handleUserLocation is called when the user shares their own location on the main bot.
-// It loads all configured fast food locations and shows the nearest ones (5 per page).
 func (b *Bot) handleUserLocation(chatID int64, userID int64, lat, lon float64) {
+	l := b.getLang(userID)
 	ctx := context.Background()
 	locs, err := services.ListLocations(ctx)
 	if err != nil {
-		b.removeKeyboard(chatID, "Joylashuvlar ro'yxatini yuklashda xatolik yuz berdi.")
+		b.removeKeyboard(chatID, lang.T(l, "locations_err"))
 		return
 	}
 	if len(locs) == 0 {
-		// Even if no branches exist, user has shared location, so allow menu access
-		b.removeKeyboard(chatID, "Hozircha fast food joylari ro'yxatiga qo'shilmagan. Lekin siz menyuni ko'rishingiz mumkin.")
+		b.removeKeyboard(chatID, lang.T(l, "no_branches"))
 		b.sendMenu(chatID, userID)
 		return
 	}
@@ -655,10 +722,11 @@ func (b *Bot) sendLocationSuggestions(chatID int64, userID int64, page int, from
 	b.locSuggestionsMu.RUnlock()
 
 	if len(list) == 0 {
+		txt := lang.T(b.getLang(userID), "no_locations")
 		if fromCallback {
-			b.send(chatID, "Hozircha joylashuvlar topilmadi.")
+			b.send(chatID, txt)
 		} else {
-			b.removeKeyboard(chatID, "Hozircha joylashuvlar topilmadi.")
+			b.removeKeyboard(chatID, txt)
 		}
 		return
 	}
@@ -673,27 +741,27 @@ func (b *Bot) sendLocationSuggestions(chatID int64, userID int64, page int, from
 		end = len(list)
 	}
 
-	text := "📍 Sizga eng yaqin fast food joylari:\n\n"
+	langCode := b.getLang(userID)
+	text := lang.T(langCode, "nearest_locations")
 	var buttons [][]tgbotapi.InlineKeyboardButton
 	for i := start; i < end; i++ {
-		l := list[i]
-		text += fmt.Sprintf("%d) %s — %.1f km\n", i+1, l.Location.Name, l.Distance)
-		// One button per location to select it
+		loc := list[i]
+		text += fmt.Sprintf("%d) %s — %.1f km\n", i+1, loc.Location.Name, loc.Distance)
 		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(
-				fmt.Sprintf("%d) %s", i+1, l.Location.Name),
-				fmt.Sprintf("locsel:%d", l.Location.ID),
+				fmt.Sprintf("%d) %s", i+1, loc.Location.Name),
+				fmt.Sprintf("locsel:%d", loc.Location.ID),
 			),
 		))
 	}
-	text += "\nFilialni tanlash uchun yuqoridagi tugmalardan birini bosing.\nSahifalar orasida o'tish uchun quyidagi tugmalardan foydalaning."
+	text += lang.T(langCode, "select_branch")
 
 	var row []tgbotapi.InlineKeyboardButton
 	if page > 0 {
-		row = append(row, tgbotapi.NewInlineKeyboardButtonData("« Oldingi", fmt.Sprintf("loc:page:%d", page-1)))
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(lang.T(langCode, "prev"), fmt.Sprintf("loc:page:%d", page-1)))
 	}
 	if end < len(list) {
-		row = append(row, tgbotapi.NewInlineKeyboardButtonData("Keyingi »", fmt.Sprintf("loc:page:%d", page+1)))
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(lang.T(langCode, "next"), fmt.Sprintf("loc:page:%d", page+1)))
 	}
 	if len(row) > 0 {
 		buttons = append(buttons, row)
@@ -721,8 +789,9 @@ func (b *Bot) sendLocationSuggestionsManual(chatID int64, userID int64, page int
 		b.removeKeyboard(chatID, "Joylashuvlar ro'yxatini yuklashda xatolik yuz berdi.")
 		return
 	}
+	l := b.getLang(userID)
 	if len(locs) == 0 {
-		b.removeKeyboard(chatID, "Hozircha fast food joylari ro'yxatiga qo'shilmagan.")
+		b.removeKeyboard(chatID, lang.T(l, "no_branches_manual"))
 		b.sendMenu(chatID, userID)
 		return
 	}
@@ -737,27 +806,27 @@ func (b *Bot) sendLocationSuggestionsManual(chatID int64, userID int64, page int
 		end = len(locs)
 	}
 
-	text := "📍 Fast food joylari ro'yxati:\n\n"
+	text := lang.T(l, "locations_list")
 	var buttons [][]tgbotapi.InlineKeyboardButton
 	for i := start; i < end; i++ {
-		l := locs[i]
-		text += fmt.Sprintf("%d) %s\n", i+1, l.Name)
+		loc := locs[i]
+		text += fmt.Sprintf("%d) %s\n", i+1, loc.Name)
 		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(
-				fmt.Sprintf("%d) %s", i+1, l.Name),
-				fmt.Sprintf("locsel:%d", l.ID),
+				fmt.Sprintf("%d) %s", i+1, loc.Name),
+				fmt.Sprintf("locsel:%d", loc.ID),
 			),
 		))
 	}
-	text += "\nFilialni tanlash uchun yuqoridagi tugmalardan birini bosing.\nSahifalar orasida o'tish uchun quyidagi tugmalardan foydalaning."
+	text += lang.T(l, "select_branch")
 
 	var buttonsNav [][]tgbotapi.InlineKeyboardButton
 	var row []tgbotapi.InlineKeyboardButton
 	if page > 0 {
-		row = append(row, tgbotapi.NewInlineKeyboardButtonData("« Oldingi", fmt.Sprintf("locm:page:%d", page-1)))
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "prev"), fmt.Sprintf("locm:page:%d", page-1)))
 	}
 	if end < len(locs) {
-		row = append(row, tgbotapi.NewInlineKeyboardButtonData("Keyingi »", fmt.Sprintf("locm:page:%d", page+1)))
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "next"), fmt.Sprintf("locm:page:%d", page+1)))
 	}
 	if len(row) > 0 {
 		buttonsNav = append(buttonsNav, row)
@@ -780,15 +849,15 @@ func (b *Bot) handleContact(chatID int64, userID int64, phone string, customerUs
 	_, hasLocation := b.userSharedCoords[userID]
 	b.userSharedCoordsMu.RUnlock()
 	if !hasLocation {
-		b.removeKeyboard(chatID, "Iltimos, avval lokatsiyangizni ulashing. Buyurtma berish uchun lokatsiya majburiydir.")
-		b.handleStart(chatID, userID)
+		b.sendLang(chatID, userID, "please_share_loc")
+		b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
 		return
 	}
-
+	l := b.getLang(userID)
 	ctx := context.Background()
 	checkout, err := services.GetCheckout(ctx, userID)
 	if err != nil || checkout == nil || len(checkout.CartItems) == 0 {
-		b.removeKeyboard(chatID, "Iltimos, avval buyurtma qo'shing.")
+		b.removeKeyboard(chatID, lang.T(l, "please_add_order"))
 		return
 	}
 	itemsTotal := checkout.ItemsTotal
@@ -820,12 +889,21 @@ func (b *Bot) handleContact(chatID int64, userID int64, phone string, customerUs
 	if userLocation != nil {
 		locationID = userLocation.ID
 	}
-	// Calculate distance from restaurant to customer delivery location
+	// Taxi-style delivery fee: 5000 start + 4000 per km
+	baseFee := b.cfg.Delivery.BaseFee
+	if baseFee < 0 {
+		baseFee = 5000
+	}
+	ratePerKm := b.cfg.Delivery.RatePerKm
+	if ratePerKm <= 0 {
+		ratePerKm = 4000
+	}
 	var distanceKm float64
 	var deliveryFee int64
 	if hasUserLocation && userLocation != nil {
 		distanceKm = services.HaversineDistanceKm(userLocation.Lat, userLocation.Lon, userLat, userLon)
-		deliveryFee = services.CalcDeliveryFee(distanceKm, 2000)
+		rawFee := services.CalcDeliveryFee(distanceKm, baseFee, ratePerKm)
+		deliveryFee = services.ApplyDeliveryFeeRule(rawFee)
 	}
 	id, err := services.CreateOrder(ctx, models.CreateOrderInput{
 		UserID:      userID,
@@ -839,88 +917,99 @@ func (b *Bot) handleContact(chatID int64, userID int64, phone string, customerUs
 		LocationID:  locationID,
 	})
 	if err != nil {
-		b.send(chatID, "Order failed: "+err.Error())
+		b.sendLang(chatID, userID, "order_failed", err.Error())
 		return
 	}
 
-	b.removeKeyboard(chatID, fmt.Sprintf(
-		"✅ Buyurtma #%d tasdiqlandi\n\n📱 Raqam: %s\n🛒 Mahsulotlar jami: %d\n💵 Jami: %d\n\nTez orada siz bilan aloqada bo'lamiz.",
-		id, phone, itemsTotal, itemsTotal,
-	))
+	confirmMsg := lang.T(l, "order_confirmed", id, phone, itemsTotal)
+	confirmMsg += lang.T(l, "order_total", itemsTotal+deliveryFee)
+	b.removeKeyboard(chatID, confirmMsg)
 
 	// Send order card only to that restaurant's admin (with status buttons)
-	b.notifyAdmin(id, phone, items, itemsTotal, customerUsername, userLocation, userLat, userLon, hasUserLocation)
+	b.notifyAdmin(id, phone, items, itemsTotal, deliveryFee, distanceKm, customerUsername, userLocation, userLat, userLon, hasUserLocation)
 }
 
-func (b *Bot) notifyAdmin(orderID int64, phone string, items []cartItem, total int64, customerUsername string, location *models.Location, userLat, userLon float64, hasUserLocation bool) {
+func (b *Bot) notifyAdmin(orderID int64, phone string, items []cartItem, itemsTotal, deliveryFee int64, distanceKm float64, customerUsername string, location *models.Location, userLat, userLon float64, hasUserLocation bool) {
 	if b.messageBot == nil {
 		return // MESSAGE_TOKEN not set or failed to initialize
 	}
 
-	// Order card: New Order #id, Customer, Items, Total, Status: NEW
-	customerLabel := "Customer: (no username)"
-	if customerUsername != "" {
-		customerLabel = "Customer: @" + customerUsername
-	}
-	text := fmt.Sprintf("New Order #%d\n%s\n\nItems:\n", orderID, customerLabel)
-	for _, it := range items {
-		text += fmt.Sprintf("- %s x%d\n", it.Name, it.Qty)
-	}
-	text += fmt.Sprintf("\nTotal: %d UZS\n\nStatus: NEW", total)
-
-	// Buttons for new order: [Start Preparing] [Mark Ready]
-	kb := b.orderStatusKeyboard(orderID, services.OrderStatusNew, nil)
-
-	// Get branch admins for this restaurant only
-	var adminIDs []int64
 	ctx := context.Background()
+	// Get branch admins with their preferred order language
+	var admins []services.BranchAdminWithLang
 	if location != nil {
 		var err error
-		adminIDs, err = services.GetBranchAdmins(ctx, location.ID)
+		admins, err = services.GetBranchAdminsWithLang(ctx, location.ID)
 		if err != nil {
 			log.Printf("failed to get branch admins for location %d: %v", location.ID, err)
 		}
 	}
-	if len(adminIDs) == 0 && b.admin != 0 {
-		adminIDs = []int64{b.admin}
+	// Fallback to main admin if no branch admins
+	if len(admins) == 0 && b.admin != 0 {
+		orderLang, _ := services.GetAdminOrderLang(ctx, b.admin)
+		admins = []services.BranchAdminWithLang{{AdminUserID: b.admin, OrderLang: orderLang}}
 	}
-	if len(adminIDs) == 0 {
+	if len(admins) == 0 {
 		log.Printf("warning: no branch admins for order #%d", orderID)
 		return
 	}
 
-	for _, adminID := range adminIDs {
-		msg := tgbotapi.NewMessage(adminID, text)
+	// Send localized order card to each admin
+	for _, admin := range admins {
+		adminLang := admin.OrderLang
+		if adminLang == "" {
+			adminLang = lang.Uz
+		}
+
+		// Build order card text in admin's language
+		customerLabel := lang.T(adminLang, "adm_customer_no_user")
+		if customerUsername != "" {
+			customerLabel = fmt.Sprintf(lang.T(adminLang, "adm_customer"), customerUsername)
+		}
+		text := fmt.Sprintf(lang.T(adminLang, "adm_new_order"), orderID) + "\n" + customerLabel + "\n\n" + lang.T(adminLang, "adm_items") + "\n"
+		for _, it := range items {
+			text += fmt.Sprintf("- %s x%d\n", it.Name, it.Qty)
+		}
+		text += fmt.Sprintf("\n%s\n\n%s", fmt.Sprintf(lang.T(adminLang, "adm_total"), itemsTotal), fmt.Sprintf(lang.T(adminLang, "adm_status"), lang.T(adminLang, "adm_status_new")))
+
+		// Buttons in admin's language
+		kb := b.orderStatusKeyboard(orderID, services.OrderStatusNew, nil, adminLang)
+
+		msg := tgbotapi.NewMessage(admin.AdminUserID, text)
 		msg.ReplyMarkup = kb
 		sentMsg, err := b.messageBot.Send(msg)
 		if err != nil {
-			log.Printf("failed to send order card to admin %d: %v", adminID, err)
+			log.Printf("failed to send order card to admin %d: %v", admin.AdminUserID, err)
 			continue
 		}
 		// Store admin message ID for this order
-		if err := services.SetAdminMessageID(ctx, orderID, adminID, sentMsg.MessageID); err != nil {
+		if err := services.SetAdminMessageID(ctx, orderID, admin.AdminUserID, sentMsg.MessageID); err != nil {
 			log.Printf("failed to store admin message ID for order %d: %v", orderID, err)
 		}
 		if hasUserLocation {
-			locMsg := tgbotapi.NewLocation(adminID, userLat, userLon)
+			locMsg := tgbotapi.NewLocation(admin.AdminUserID, userLat, userLon)
 			_, _ = b.messageBot.Send(locMsg)
 		}
 	}
 }
 
-// orderStatusKeyboard returns inline buttons for the given order status.
-func (b *Bot) orderStatusKeyboard(orderID int64, status string, deliveryType *string) tgbotapi.InlineKeyboardMarkup {
+// orderStatusKeyboard returns inline buttons for the given order status, localized to adminLang ("uz" or "ru").
+func (b *Bot) orderStatusKeyboard(orderID int64, status string, deliveryType *string, adminLang string) tgbotapi.InlineKeyboardMarkup {
+	if adminLang == "" {
+		adminLang = lang.Uz
+	}
 	switch status {
 	case services.OrderStatusNew:
 		return tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("Start Preparing", "order_status:"+strconv.FormatInt(orderID, 10)+":"+services.OrderStatusPreparing),
+				tgbotapi.NewInlineKeyboardButtonData(lang.T(adminLang, "adm_start_preparing"), "order_status:"+strconv.FormatInt(orderID, 10)+":"+services.OrderStatusPreparing),
+				tgbotapi.NewInlineKeyboardButtonData(lang.T(adminLang, "adm_reject"), "order_status:"+strconv.FormatInt(orderID, 10)+":"+services.OrderStatusRejected),
 			),
 		)
 	case services.OrderStatusPreparing:
 		return tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("Mark Ready", "order_status:"+strconv.FormatInt(orderID, 10)+":"+services.OrderStatusReady),
+				tgbotapi.NewInlineKeyboardButtonData(lang.T(adminLang, "adm_mark_ready"), "order_status:"+strconv.FormatInt(orderID, 10)+":"+services.OrderStatusReady),
 			),
 		)
 	case services.OrderStatusReady:
@@ -928,8 +1017,8 @@ func (b *Bot) orderStatusKeyboard(orderID int64, status string, deliveryType *st
 		if deliveryType == nil {
 			return tgbotapi.NewInlineKeyboardMarkup(
 				tgbotapi.NewInlineKeyboardRow(
-					tgbotapi.NewInlineKeyboardButtonData("Send to Delivery", "delivery_type:"+strconv.FormatInt(orderID, 10)+":delivery"),
-					tgbotapi.NewInlineKeyboardButtonData("Customer Pickup", "delivery_type:"+strconv.FormatInt(orderID, 10)+":pickup"),
+					tgbotapi.NewInlineKeyboardButtonData(lang.T(adminLang, "adm_send_delivery"), "delivery_type:"+strconv.FormatInt(orderID, 10)+":delivery"),
+					tgbotapi.NewInlineKeyboardButtonData(lang.T(adminLang, "adm_customer_pickup"), "delivery_type:"+strconv.FormatInt(orderID, 10)+":pickup"),
 				),
 			)
 		}
@@ -937,7 +1026,7 @@ func (b *Bot) orderStatusKeyboard(orderID int64, status string, deliveryType *st
 		if *deliveryType == "pickup" {
 			return tgbotapi.NewInlineKeyboardMarkup(
 				tgbotapi.NewInlineKeyboardRow(
-					tgbotapi.NewInlineKeyboardButtonData("Mark Completed", "order_status:"+strconv.FormatInt(orderID, 10)+":"+services.OrderStatusCompleted),
+					tgbotapi.NewInlineKeyboardButtonData(lang.T(adminLang, "adm_mark_completed"), "order_status:"+strconv.FormatInt(orderID, 10)+":"+services.OrderStatusCompleted),
 				),
 			)
 		}
@@ -1001,19 +1090,42 @@ func (b *Bot) handleOrderStatusCallback(cq *tgbotapi.CallbackQuery) {
 	}
 	b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "✅ Status updated."))
 
-	// Edit admin message: replace Status line and update keyboard
-	statusLabel := strings.ToUpper(newStatus)
-	if newStatus == services.OrderStatusNew {
-		statusLabel = "NEW"
+	// Get admin's preferred order language
+	adminLang, _ := services.GetAdminOrderLang(ctx, adminUserID)
+	if adminLang == "" {
+		adminLang = lang.Uz
 	}
-	newText := replaceOrderStatusInMessage(cq.Message.Text, statusLabel)
+
+	// Edit admin message: replace Status line and update keyboard
+	var statusLabel string
+	switch newStatus {
+	case services.OrderStatusNew:
+		statusLabel = lang.T(adminLang, "adm_status_new")
+	case services.OrderStatusPreparing:
+		statusLabel = lang.T(adminLang, "adm_status_preparing")
+	case services.OrderStatusReady:
+		statusLabel = lang.T(adminLang, "adm_status_ready")
+	case services.OrderStatusAssigned:
+		statusLabel = lang.T(adminLang, "adm_status_assigned")
+	case services.OrderStatusPickedUp:
+		statusLabel = lang.T(adminLang, "adm_status_picked_up")
+	case services.OrderStatusDelivering:
+		statusLabel = lang.T(adminLang, "adm_status_delivering")
+	case services.OrderStatusCompleted:
+		statusLabel = lang.T(adminLang, "adm_status_completed")
+	case services.OrderStatusRejected:
+		statusLabel = lang.T(adminLang, "adm_status_rejected")
+	default:
+		statusLabel = strings.ToUpper(newStatus)
+	}
+	newText := replaceOrderStatusInMessage(cq.Message.Text, fmt.Sprintf(lang.T(adminLang, "adm_status"), statusLabel))
 	// Get order to check delivery_type
 	o, _ := services.GetOrder(ctx, orderID)
 	var deliveryType *string
 	if o != nil {
 		deliveryType = o.DeliveryType
 	}
-	kb := b.orderStatusKeyboard(orderID, newStatus, deliveryType)
+	kb := b.orderStatusKeyboard(orderID, newStatus, deliveryType, adminLang)
 	edit := tgbotapi.NewEditMessageText(cq.Message.Chat.ID, cq.Message.MessageID, newText)
 	// Only set ReplyMarkup if keyboard has buttons (Telegram doesn't accept empty keyboards)
 	if len(kb.InlineKeyboard) > 0 {
@@ -1034,8 +1146,8 @@ func (b *Bot) handleOrderStatusCallback(cq *tgbotapi.CallbackQuery) {
 		}
 	}
 
-	// Notify customer (preparing / ready / completed) after DB commit; de-dup within 30s
-	if newStatus == services.OrderStatusPreparing || newStatus == services.OrderStatusReady || newStatus == services.OrderStatusCompleted {
+	// Notify customer (preparing / ready / completed / rejected) after DB commit; de-dup within 30s
+	if newStatus == services.OrderStatusPreparing || newStatus == services.OrderStatusReady || newStatus == services.OrderStatusCompleted || newStatus == services.OrderStatusRejected {
 		o, _ := services.GetOrder(ctx, orderID)
 		if o != nil && o.ChatID != "" {
 			skip, _ := services.SentOrderStatusNotifyWithin30s(ctx, orderID, newStatus)
@@ -1047,10 +1159,10 @@ func (b *Bot) handleOrderStatusCallback(cq *tgbotapi.CallbackQuery) {
 						log.Printf("send customer order status notify: %v", sendErr)
 					} else {
 						_ = services.SaveOutboundMessage(ctx, chatID, text, map[string]interface{}{
-							"channel":    "telegram",
-							"sent_via":   "order_status_notify",
-							"order_id":   orderID,
-							"status":     newStatus,
+							"channel":  "telegram",
+							"sent_via": "order_status_notify",
+							"order_id": orderID,
+							"status":   newStatus,
 						})
 					}
 				}
@@ -1107,9 +1219,15 @@ func (b *Bot) handleDeliveryTypeCallback(cq *tgbotapi.CallbackQuery) {
 			if err == nil {
 				hasLocation = lat != 0 && lon != 0
 			}
-			log.Printf("order sent to delivery: order_id=%d status=%s delivery_type=%s has_location=%v lat=%.6f lon=%.6f driver_visible=%v", 
+			log.Printf("order sent to delivery: order_id=%d status=%s delivery_type=%s has_location=%v lat=%.6f lon=%.6f driver_visible=%v",
 				orderID, o.Status, deliveryType, hasLocation, lat, lon, hasLocation)
 		}
+	}
+
+	// Get admin's preferred order language
+	adminLang, _ := services.GetAdminOrderLang(ctx, adminUserID)
+	if adminLang == "" {
+		adminLang = lang.Uz
 	}
 
 	// Edit admin message: update keyboard
@@ -1118,7 +1236,7 @@ func (b *Bot) handleDeliveryTypeCallback(cq *tgbotapi.CallbackQuery) {
 		return
 	}
 	deliveryTypePtr := &deliveryType
-	kb := b.orderStatusKeyboard(orderID, o.Status, deliveryTypePtr)
+	kb := b.orderStatusKeyboard(orderID, o.Status, deliveryTypePtr, adminLang)
 	edit := tgbotapi.NewEditMessageText(cq.Message.Chat.ID, cq.Message.MessageID, cq.Message.Text+"\n\n"+msgText)
 	// Only set ReplyMarkup if keyboard has buttons (Telegram doesn't accept empty keyboards)
 	if len(kb.InlineKeyboard) > 0 {
@@ -1152,10 +1270,10 @@ func (b *Bot) handleDeliveryTypeCallback(cq *tgbotapi.CallbackQuery) {
 						log.Printf("send customer order status notify: %v", sendErr)
 					} else {
 						_ = services.SaveOutboundMessage(ctx, chatID, text, map[string]interface{}{
-							"channel":    "telegram",
-							"sent_via":   "order_status_notify",
-							"order_id":   orderID,
-							"status":     services.OrderStatusReady,
+							"channel":  "telegram",
+							"sent_via": "order_status_notify",
+							"order_id": orderID,
+							"status":   services.OrderStatusReady,
 						})
 					}
 				}
@@ -1254,9 +1372,9 @@ func (b *Bot) handlePromote(chatID int64, userID int64, text string) {
 
 	parts := strings.Fields(text)
 	if len(parts) < 4 {
-		b.send(chatID, "📝 Usage: /promote <branch_location_id> <new_admin_user_id> <password>\n\n"+
-			"Example: /promote 1 123456789 MyUniquePass123\n\n"+
-			"The password must be unique (not used by any other branch admin). The new admin will use it to log in to the adder bot.\n\n"+
+		b.send(chatID, "📝 Usage: /promote <branch_location_id> <new_admin_user_id> <password> [uz|ru]\n\n"+
+			"Example: /promote 1 123456789 MyUniquePass123 uz\n\n"+
+			"The password must be unique. Last arg is the language for order notifications: uz (Uzbek) or ru (Russian). Default: uz.\n\n"+
 			"💡 To get a user's ID, ask them to use @userinfobot on Telegram.")
 		return
 	}
@@ -1276,7 +1394,17 @@ func (b *Bot) handlePromote(chatID int64, userID int64, text string) {
 		return
 	}
 
-	password := strings.TrimSpace(strings.Join(parts[3:], " "))
+	orderLang := "uz"
+	if len(parts) >= 5 && (parts[4] == "ru" || parts[4] == "uz") {
+		orderLang = parts[4]
+	}
+	// Password is parts[3]; if 5th part is uz/ru, password is just parts[3]; else password is parts[3:] (e.g. "My Pass Word")
+	password := strings.TrimSpace(parts[3])
+	if len(parts) > 4 && (parts[4] == "uz" || parts[4] == "ru") {
+		password = strings.TrimSpace(parts[3])
+	} else if len(parts) > 4 {
+		password = strings.TrimSpace(strings.Join(parts[3:], " "))
+	}
 	if password == "" {
 		b.send(chatID, "❌ Password cannot be empty.")
 		return
@@ -1289,7 +1417,7 @@ func (b *Bot) handlePromote(chatID int64, userID int64, text string) {
 	}
 
 	ctx := context.Background()
-	err = services.AddBranchAdmin(ctx, branchLocationID, newAdminID, userID, passwordHash)
+	err = services.AddBranchAdmin(ctx, branchLocationID, newAdminID, userID, passwordHash, orderLang)
 	if err != nil {
 		b.send(chatID, "❌ Failed to promote admin: "+err.Error())
 		log.Printf("failed to promote admin %d for branch %d by admin %d: %v", newAdminID, branchLocationID, userID, err)

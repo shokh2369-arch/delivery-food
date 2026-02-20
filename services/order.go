@@ -11,11 +11,15 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const defaultRatePerKm = 2000
+const (
+	defaultBaseFee   = 5000 // start price (sum)
+	defaultRatePerKm = 4000 // sum per km
+)
 
-// Order status enum: new (waiting) -> preparing -> ready -> assigned -> picked_up -> delivering -> completed
+// Order status enum: new (waiting) -> preparing -> ready -> ... -> completed; or new -> rejected
 const (
 	OrderStatusNew        = "new"
+	OrderStatusRejected   = "rejected"
 	OrderStatusPreparing  = "preparing"
 	OrderStatusReady      = "ready"
 	OrderStatusAssigned   = "assigned"
@@ -24,12 +28,39 @@ const (
 	OrderStatusCompleted  = "completed"
 )
 
-func CalcDeliveryFee(distanceKm float64, ratePerKm int64) int64 {
-	if ratePerKm == 0 {
+// CalcDeliveryFee returns taxi-style fee: baseFee + (distance_km * ratePerKm).
+func CalcDeliveryFee(distanceKm float64, baseFee, ratePerKm int64) int64 {
+	if baseFee < 0 {
+		baseFee = defaultBaseFee
+	}
+	if ratePerKm <= 0 {
 		ratePerKm = defaultRatePerKm
 	}
 	rounded := math.Ceil(distanceKm*10) / 10
-	return int64(math.Round(rounded * float64(ratePerKm)))
+	perKmPart := int64(math.Round(rounded * float64(ratePerKm)))
+	return baseFee + perKmPart
+}
+
+// ApplyDeliveryFeeRule rounds the calculated delivery fee to the nearest 1000 sum (e.g. 2400 -> 2000, 2600 -> 3000).
+func ApplyDeliveryFeeRule(calculatedFee int64) int64 {
+	if calculatedFee <= 0 {
+		return 0
+	}
+	return (calculatedFee + 500) / 1000 * 1000
+}
+
+// FormatDeliveryFeeBreakdown returns a taxi-style breakdown string (e.g. "Boshlang'ich: 5 000 so'm\nMasofa: 2.5 km × 2 000 = 5 000 so'm\nYetkazib berish: 10 000 so'm").
+func FormatDeliveryFeeBreakdown(distanceKm float64, baseFee, ratePerKm, totalDeliveryFee int64) string {
+	if ratePerKm <= 0 {
+		ratePerKm = defaultRatePerKm
+	}
+	if baseFee < 0 {
+		baseFee = defaultBaseFee
+	}
+	rounded := math.Ceil(distanceKm*10) / 10
+	perKmPart := int64(math.Round(rounded * float64(ratePerKm)))
+	return fmt.Sprintf("Boshlang'ich: %d so'm\nMasofa: %.1f km × %d = %d so'm\nYetkazib berish: %d so'm",
+		baseFee, rounded, ratePerKm, perKmPart, totalDeliveryFee)
 }
 
 func HaversineDistanceKm(lat1, lon1, lat2, lon2 float64) float64 {
@@ -53,7 +84,7 @@ func CreateOrder(ctx context.Context, input models.CreateOrderInput) (int64, err
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING id`,
 		input.UserID, input.ChatID, input.Phone, input.Lat, input.Lon, input.DistanceKm,
-		2000, input.DeliveryFee, input.ItemsTotal, grandTotal, OrderStatusNew, input.LocationID,
+		4000, input.DeliveryFee, input.ItemsTotal, grandTotal, OrderStatusNew, input.LocationID,
 	).Scan(&id)
 	return id, err
 }
@@ -63,10 +94,11 @@ func GetOrder(ctx context.Context, orderID int64) (*models.Order, error) {
 	var o models.Order
 	var deliveryType *string
 	err := db.Pool.QueryRow(ctx, `
-		SELECT id, COALESCE(location_id, 0), status, chat_id, items_total, grand_total, delivery_type
+		SELECT id, COALESCE(location_id, 0), status, chat_id, items_total, grand_total,
+		       COALESCE(delivery_fee, 0), COALESCE(distance_km, 0), delivery_type
 		FROM orders WHERE id = $1`,
 		orderID,
-	).Scan(&o.ID, &o.LocationID, &o.Status, &o.ChatID, &o.ItemsTotal, &o.GrandTotal, &deliveryType)
+	).Scan(&o.ID, &o.LocationID, &o.Status, &o.ChatID, &o.ItemsTotal, &o.GrandTotal, &o.DeliveryFee, &o.DistanceKm, &deliveryType)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -100,11 +132,14 @@ var validStatusTransition = map[string]string{
 }
 
 // ValidStatusTransition returns true if transitioning from 'from' to 'to' is allowed.
-// For ready -> completed, also check delivery_type (pickup allows direct completion).
 func ValidStatusTransition(from, to string) bool {
 	// Special case: ready -> completed is allowed for pickup orders
 	if from == OrderStatusReady && to == OrderStatusCompleted {
 		return true // Will be validated in UpdateOrderStatus based on delivery_type
+	}
+	// Admin can reject a new order
+	if from == OrderStatusNew && to == OrderStatusRejected {
+		return true
 	}
 	next, ok := validStatusTransition[from]
 	return ok && next == to
@@ -227,6 +262,8 @@ func CustomerMessageForOrderStatus(o *models.Order, newStatus string) string {
 		return fmt.Sprintf("🛵 Buyurtmangiz yo'lda.%s", summary)
 	case OrderStatusCompleted:
 		return fmt.Sprintf("✅ Buyurtmangiz yetkazildi. Rahmat!%s", summary)
+	case OrderStatusRejected:
+		return fmt.Sprintf("❌ Afsuski, buyurtmangiz #%d rad etildi. Savol bo'lsa, biz bilan bog'laning.", o.ID)
 	default:
 		return fmt.Sprintf("Buyurtma #%d — yangilandi: %s.%s", o.ID, newStatus, summary)
 	}

@@ -144,13 +144,15 @@ func GetDriverLocationAny(ctx context.Context, driverID string) (*DriverLocation
 
 // ReadyOrderForDriver represents a ready order visible to drivers.
 type ReadyOrderForDriver struct {
-	ID         int64
-	LocationID int64
-	Lat        float64
-	Lon        float64
-	ItemsTotal int64
-	GrandTotal int64
-	DistanceKm float64
+	ID              int64
+	LocationID      int64
+	Lat             float64
+	Lon             float64
+	ItemsTotal      int64
+	GrandTotal      int64
+	DeliveryFee     int64   // for taxi breakdown
+	OrderDistanceKm float64 // restaurant-to-customer km for breakdown
+	DistanceKm      float64 // driver-to-order distance
 }
 
 // CountReadyOrders returns count of READY orders (status='ready' AND driver_id IS NULL) for debugging.
@@ -178,11 +180,12 @@ func GetNearbyReadyOrders(ctx context.Context, driverLat, driverLon float64, rad
 	// R = 6371 km (Earth radius)
 	rows, err := db.Pool.Query(ctx, `
 		SELECT id, COALESCE(location_id, 0), lat, lon, items_total, grand_total,
+		       COALESCE(delivery_fee, 0), COALESCE(distance_km, 0),
 		       (6371 * acos(
 		           cos(radians($1)) * cos(radians(lat)) *
 		           cos(radians(lon) - radians($2)) +
 		           sin(radians($1)) * sin(radians(lat))
-		       )) AS distance_km
+		       )) AS driver_distance_km
 		FROM orders
 		WHERE status = $3 
 		  AND driver_id IS NULL 
@@ -194,7 +197,7 @@ func GetNearbyReadyOrders(ctx context.Context, driverLat, driverLon float64, rad
 		      cos(radians(lon) - radians($2)) +
 		      sin(radians($1)) * sin(radians(lat))
 		  )) <= $4
-		ORDER BY distance_km ASC
+		ORDER BY driver_distance_km ASC
 		LIMIT $5`,
 		driverLat, driverLon, OrderStatusReady, radiusKm, limit,
 	)
@@ -205,7 +208,7 @@ func GetNearbyReadyOrders(ctx context.Context, driverLat, driverLon float64, rad
 	var orders []ReadyOrderForDriver
 	for rows.Next() {
 		var o ReadyOrderForDriver
-		if err := rows.Scan(&o.ID, &o.LocationID, &o.Lat, &o.Lon, &o.ItemsTotal, &o.GrandTotal, &o.DistanceKm); err != nil {
+		if err := rows.Scan(&o.ID, &o.LocationID, &o.Lat, &o.Lon, &o.ItemsTotal, &o.GrandTotal, &o.DeliveryFee, &o.OrderDistanceKm, &o.DistanceKm); err != nil {
 			return nil, err
 		}
 		orders = append(orders, o)
@@ -226,9 +229,9 @@ func AcceptOrder(ctx context.Context, orderID int64, driverID string, driverTgUs
 		UPDATE orders
 		SET driver_id = $1, assigned_at = now(), status = $4, updated_at = now()
 		WHERE id = $2 AND status = $3 AND driver_id IS NULL
-		RETURNING id, COALESCE(location_id, 0), status, chat_id, items_total, grand_total`,
+		RETURNING id, COALESCE(location_id, 0), status, chat_id, items_total, grand_total, COALESCE(delivery_fee, 0), COALESCE(distance_km, 0)`,
 		driverID, orderID, OrderStatusReady, OrderStatusAssigned,
-	).Scan(&o.ID, &o.LocationID, &o.Status, &o.ChatID, &o.ItemsTotal, &o.GrandTotal)
+	).Scan(&o.ID, &o.LocationID, &o.Status, &o.ChatID, &o.ItemsTotal, &o.GrandTotal, &o.DeliveryFee, &o.DistanceKm)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Check if order exists but was already taken
@@ -260,13 +263,13 @@ func AcceptOrder(ctx context.Context, orderID int64, driverID string, driverTgUs
 func GetDriverActiveOrder(ctx context.Context, driverID string) (*models.Order, error) {
 	var o models.Order
 	err := db.Pool.QueryRow(ctx, `
-		SELECT id, COALESCE(location_id, 0), status, chat_id, items_total, grand_total
+		SELECT id, COALESCE(location_id, 0), status, chat_id, items_total, grand_total, COALESCE(delivery_fee, 0), COALESCE(distance_km, 0)
 		FROM orders
 		WHERE driver_id = $1 AND status IN ($2, $3, $4)
 		ORDER BY assigned_at DESC
 		LIMIT 1`,
 		driverID, OrderStatusAssigned, OrderStatusPickedUp, OrderStatusDelivering,
-	).Scan(&o.ID, &o.LocationID, &o.Status, &o.ChatID, &o.ItemsTotal, &o.GrandTotal)
+	).Scan(&o.ID, &o.LocationID, &o.Status, &o.ChatID, &o.ItemsTotal, &o.GrandTotal, &o.DeliveryFee, &o.DistanceKm)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil

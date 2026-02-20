@@ -9,17 +9,20 @@ import (
 	"sync"
 
 	"food-telegram/config"
+	"food-telegram/lang"
 	"food-telegram/services"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // DriverBot handles driver interactions (uses DRIVER_BOT_TOKEN).
 type DriverBot struct {
-	api        *tgbotapi.BotAPI
-	mainBot    *tgbotapi.BotAPI // for sending customer notifications
-	messageBot *tgbotapi.BotAPI // for sending admin notifications
-	config     *config.Config
-	stateMu    sync.RWMutex
+	api         *tgbotapi.BotAPI
+	mainBot     *tgbotapi.BotAPI // for sending customer notifications
+	messageBot  *tgbotapi.BotAPI // for sending admin notifications
+	config      *config.Config
+	stateMu     sync.RWMutex
+	driverLang  map[int64]string // "uz" or "ru"
+	driverLangMu sync.RWMutex
 }
 
 // NewDriverBot creates a driver bot using DRIVER_BOT_TOKEN.
@@ -32,11 +35,40 @@ func NewDriverBot(cfg *config.Config, mainBotAPI *tgbotapi.BotAPI, messageBotAPI
 		return nil, err
 	}
 	return &DriverBot{
-		api:        api,
-		mainBot:    mainBotAPI,
-		messageBot: messageBotAPI,
-		config:     cfg,
+		api:         api,
+		mainBot:     mainBotAPI,
+		messageBot:  messageBotAPI,
+		config:      cfg,
+		driverLang:  make(map[int64]string),
 	}, nil
+}
+
+func (d *DriverBot) getLang(userID int64) string {
+	d.driverLangMu.RLock()
+	defer d.driverLangMu.RUnlock()
+	l := d.driverLang[userID]
+	if l == "" || (l != lang.Uz && l != lang.Ru) {
+		return ""
+	}
+	return l
+}
+
+func (d *DriverBot) setLang(userID int64, langCode string) {
+	if langCode != lang.Uz && langCode != lang.Ru {
+		return
+	}
+	d.driverLangMu.Lock()
+	defer d.driverLangMu.Unlock()
+	d.driverLang[userID] = langCode
+}
+
+func (d *DriverBot) sendLang(chatID int64, userID int64, key string, args ...interface{}) {
+	l := d.getLang(userID)
+	if l == "" {
+		l = lang.Uz
+	}
+	text := lang.T(l, key, args...)
+	d.send(chatID, text)
 }
 
 func (d *DriverBot) Start() {
@@ -68,7 +100,7 @@ func (d *DriverBot) Start() {
 			continue
 		}
 
-		d.send(msg.Chat.ID, "Iltimos, tugmalardan birini tanlang.")
+		d.sendLang(msg.Chat.ID, userID, "dr_please_use_buttons")
 	}
 }
 
@@ -88,13 +120,18 @@ func (d *DriverBot) sendWithInline(chatID int64, text string, kb tgbotapi.Inline
 }
 
 func (d *DriverBot) handleStart(chatID int64, userID int64) {
-	ctx := context.Background()
-	driver, err := services.RegisterDriver(ctx, userID, chatID)
-	if err != nil {
-		d.send(chatID, "Xatolik: "+err.Error())
-		return
+	// Always show language selection on /start
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("O'zbek", "lang:uz"),
+			tgbotapi.NewInlineKeyboardButtonData("Русский", "lang:ru"),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, lang.T(lang.Uz, "choose_lang_both"))
+	msg.ReplyMarkup = kb
+	if _, err := d.api.Send(msg); err != nil {
+		log.Printf("driver bot send error: %v", err)
 	}
-	d.sendDriverPanel(chatID, driver)
 }
 
 func (d *DriverBot) sendDriverPanel(chatID int64, driver *services.Driver) {
@@ -102,13 +139,16 @@ func (d *DriverBot) sendDriverPanel(chatID int64, driver *services.Driver) {
 }
 
 func (d *DriverBot) sendDriverPanelWithLocation(chatID int64, driver *services.Driver, knownLocation *services.DriverLocation) {
+	l := d.getLang(driver.TgUserID)
+	if l == "" {
+		l = lang.Uz
+	}
 	statusEmoji := "🟢"
 	if driver.Status == services.DriverStatusOffline {
 		statusEmoji = "🔴"
 	}
-	text := fmt.Sprintf("🚗 Yetkazib beruvchi paneli\n\nHolat: %s %s", statusEmoji, driver.Status)
-	
-	// Check if driver has recent location
+	text := fmt.Sprintf(lang.T(l, "dr_panel"), statusEmoji, driver.Status)
+
 	ctx := context.Background()
 	hasLocation := false
 	var loc *services.DriverLocation
@@ -122,27 +162,30 @@ func (d *DriverBot) sendDriverPanelWithLocation(chatID int64, driver *services.D
 		}
 	}
 	if hasLocation && loc != nil {
-		text += fmt.Sprintf("\n📍 Lokatsiya: (%.4f, %.4f)", loc.Lat, loc.Lon)
+		text += "\n" + fmt.Sprintf(lang.T(l, "dr_location_coords"), loc.Lat, loc.Lon)
 	} else if driver.Status == services.DriverStatusOnline {
-		text += "\n⚠️ Lokatsiya topilmadi — \"Share Location\" tugmasini bosing."
+		text += "\n" + lang.T(l, "dr_location_missing")
 	}
-	
-	kb := d.driverKeyboard(driver.Status, hasLocation)
+
+	kb := d.driverKeyboard(driver.TgUserID, driver.Status, hasLocation)
 	d.sendWithInline(chatID, text, kb)
 }
 
-func (d *DriverBot) driverKeyboard(status string, hasLocation bool) tgbotapi.InlineKeyboardMarkup {
+func (d *DriverBot) driverKeyboard(userID int64, status string, hasLocation bool) tgbotapi.InlineKeyboardMarkup {
+	l := d.getLang(userID)
+	if l == "" {
+		l = lang.Uz
+	}
 	rows := [][]tgbotapi.InlineKeyboardButton{
 		{
-			tgbotapi.NewInlineKeyboardButtonData("🟢 Go Online", "driver:online"),
-			tgbotapi.NewInlineKeyboardButtonData("🔴 Go Offline", "driver:offline"),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_go_online"), "driver:online"),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_go_offline"), "driver:offline"),
 		},
 	}
-	// Only show Jobs/Active Order if online AND has location
 	if status == services.DriverStatusOnline && hasLocation {
 		rows = append(rows, []tgbotapi.InlineKeyboardButton{
-			tgbotapi.NewInlineKeyboardButtonData("📋 Jobs Near Me", "driver:jobs"),
-			tgbotapi.NewInlineKeyboardButtonData("📦 My Active Order", "driver:active"),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_jobs"), "driver:jobs"),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_active_order"), "driver:active"),
 		})
 	}
 	return tgbotapi.NewInlineKeyboardMarkup(rows...)
@@ -152,38 +195,38 @@ func (d *DriverBot) handleLocation(chatID int64, userID int64, lat, lon float64)
 	ctx := context.Background()
 	driver, err := services.GetDriverByTgUserID(ctx, userID)
 	if err != nil || driver == nil {
-		d.send(chatID, "Iltimos, avval /start ni bosing.")
+		d.sendLang(chatID, userID, "dr_please_start")
 		return
 	}
 	if driver.Status != services.DriverStatusOnline {
-		d.send(chatID, "❌ Avval \"Go Online\" tugmasini bosing.")
+		d.sendLang(chatID, userID, "dr_please_go_online")
 		return
 	}
 	if err := services.UpdateDriverLocation(ctx, driver.ID, lat, lon); err != nil {
 		log.Printf("update driver location: %v", err)
-		d.send(chatID, "❌ Lokatsiyani saqlashda xatolik.")
+		d.sendLang(chatID, userID, "dr_location_save_err")
 		return
 	}
 	log.Printf("driver location saved: driver_id=%s lat=%.6f lon=%.6f", driver.ID, lat, lon)
-	// Refresh driver object to get updated status
 	driver, _ = services.GetDriverByTgUserID(ctx, userID)
 	if driver != nil {
-		// Create location object from what we just saved
 		loc := &services.DriverLocation{
 			DriverID: driver.ID,
 			Lat:      lat,
 			Lon:      lon,
 		}
-		// Acknowledge and refresh panel to show Jobs/Active Order buttons
-		// Keep location keyboard visible for future updates
+		l := d.getLang(userID)
+		if l == "" {
+			l = lang.Uz
+		}
 		kb := tgbotapi.NewReplyKeyboard(
 			tgbotapi.NewKeyboardButtonRow(
-				tgbotapi.NewKeyboardButtonLocation("📍 Share Location"),
+				tgbotapi.NewKeyboardButtonLocation(lang.T(l, "dr_share_location")),
 			),
 		)
 		kb.OneTimeKeyboard = false
 		kb.ResizeKeyboard = true
-		msg := tgbotapi.NewMessage(chatID, "✅ Lokatsiya yangilandi.")
+		msg := tgbotapi.NewMessage(chatID, lang.T(l, "dr_location_updated"))
 		msg.ReplyMarkup = kb
 		d.api.Send(msg)
 		d.sendDriverPanelWithLocation(chatID, driver, loc)
@@ -197,36 +240,53 @@ func (d *DriverBot) handleCallback(cq *tgbotapi.CallbackQuery) {
 
 	d.api.Request(tgbotapi.NewCallback(cq.ID, ""))
 
+	// Language selection (before driver is required)
+	if data == "lang:uz" || data == "lang:ru" {
+		langCode := strings.TrimPrefix(data, "lang:")
+		d.setLang(userID, langCode)
+		ctx := context.Background()
+		driver, err := services.RegisterDriver(ctx, userID, chatID)
+		if err != nil {
+			d.sendLang(chatID, userID, "dr_error", err.Error())
+			return
+		}
+		d.sendDriverPanel(chatID, driver)
+		return
+	}
+
 	ctx := context.Background()
 	driver, err := services.GetDriverByTgUserID(ctx, userID)
 	if err != nil || driver == nil {
-		d.send(chatID, "Iltimos, avval /start ni bosing.")
+		d.sendLang(chatID, userID, "dr_please_start")
 		return
 	}
 
 	switch {
 	case data == "driver:online":
 		if err := services.UpdateDriverStatus(ctx, driver.ID, services.DriverStatusOnline); err != nil {
-			d.send(chatID, "Xatolik: "+err.Error())
+			d.sendLang(chatID, driver.TgUserID, "dr_error", err.Error())
 			return
+		}
+		l := d.getLang(driver.TgUserID)
+		if l == "" {
+			l = lang.Uz
 		}
 		kb := tgbotapi.NewReplyKeyboard(
 			tgbotapi.NewKeyboardButtonRow(
-				tgbotapi.NewKeyboardButtonLocation("📍 Share Location"),
+				tgbotapi.NewKeyboardButtonLocation(lang.T(l, "dr_share_location")),
 			),
 		)
 		kb.OneTimeKeyboard = false
 		kb.ResizeKeyboard = true
-		msg := tgbotapi.NewMessage(chatID, "✅ Online holatga o'tdingiz.\n\n📍 Iltimos, \"Share Location\" tugmasini bosing va lokatsiyangizni ulashing. Shundan so'ng \"Jobs Near Me\" va \"My Active Order\" tugmalari ko'rinadi.")
+		msg := tgbotapi.NewMessage(chatID, lang.T(l, "dr_online_success"))
 		msg.ReplyMarkup = kb
 		d.api.Send(msg)
-		// Don't show panel yet - wait for location to be shared
 	case data == "driver:offline":
 		if err := services.UpdateDriverStatus(ctx, driver.ID, services.DriverStatusOffline); err != nil {
-			d.send(chatID, "Xatolik: "+err.Error())
+			d.sendLang(chatID, driver.TgUserID, "dr_error", err.Error())
 			return
 		}
-		removeKb := tgbotapi.NewMessage(chatID, "🔴 Offline holatga o'tdingiz.")
+		removeKb := tgbotapi.NewMessage(chatID, lang.T(d.getLang(driver.TgUserID), "dr_offline_success"))
 		removeKb.ReplyMarkup = tgbotapi.NewRemoveKeyboard(true)
 		d.api.Send(removeKb)
 		driver.Status = services.DriverStatusOffline
@@ -239,19 +299,19 @@ func (d *DriverBot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		orderIDStr := strings.TrimPrefix(data, "driver_accept:")
 		orderID, err := strconv.ParseInt(orderIDStr, 10, 64)
 		if err != nil || orderID <= 0 {
-			d.send(chatID, "Noto'g'ri buyurtma ID.")
+			d.sendLang(chatID, driver.TgUserID, "dr_invalid_order_id")
 			return
 		}
 		d.handleAcceptOrder(chatID, driver, orderID)
 	case strings.HasPrefix(data, "driver_status:"):
 		parts := strings.SplitN(data, ":", 3)
 		if len(parts) != 3 {
-			d.api.Request(tgbotapi.NewCallback(cq.ID, "Noto'g'ri callback."))
+			d.api.Request(tgbotapi.NewCallback(cq.ID, lang.T(d.getLang(driver.TgUserID), "dr_invalid_order_id")))
 			return
 		}
 		orderID, err := strconv.ParseInt(parts[1], 10, 64)
 		if err != nil || orderID <= 0 {
-			d.api.Request(tgbotapi.NewCallback(cq.ID, "Noto'g'ri buyurtma ID."))
+			d.api.Request(tgbotapi.NewCallback(cq.ID, lang.T(d.getLang(driver.TgUserID), "dr_invalid_order_id")))
 			return
 		}
 		newStatus := parts[2]
@@ -260,12 +320,12 @@ func (d *DriverBot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		} else {
 			d.handleDriverStatusUpdate(chatID, driver, orderID, newStatus, cq.Message.MessageID)
 		}
-		d.api.Request(tgbotapi.NewCallback(cq.ID, "✅ Status yangilandi."))
+		d.api.Request(tgbotapi.NewCallback(cq.ID, lang.T(d.getLang(driver.TgUserID), "dr_status_updated")))
 	case strings.HasPrefix(data, "driver_done:"):
 		orderIDStr := strings.TrimPrefix(data, "driver_done:")
 		orderID, err := strconv.ParseInt(orderIDStr, 10, 64)
 		if err != nil || orderID <= 0 {
-			d.send(chatID, "Noto'g'ri buyurtma ID.")
+			d.sendLang(chatID, driver.TgUserID, "dr_invalid_order_id")
 			return
 		}
 		d.handleCompleteDelivery(chatID, driver, orderID, 0)
@@ -275,119 +335,99 @@ func (d *DriverBot) handleCallback(cq *tgbotapi.CallbackQuery) {
 }
 
 func (d *DriverBot) handleJobsNearMe(chatID int64, driver *services.Driver) {
+	l := d.getLang(driver.TgUserID)
+	if l == "" {
+		l = lang.Uz
+	}
 	if driver.Status != services.DriverStatusOnline {
-		d.send(chatID, "❌ Avval \"Go Online\" tugmasini bosing.")
+		d.sendLang(chatID, driver.TgUserID, "dr_please_go_online")
 		return
 	}
 	ctx := context.Background()
-	
-	// Debug: Log driver info
-	log.Printf("driver jobs: driver tg_user_id=%d driver_db_id=%s driver_status=%s", driver.TgUserID, driver.ID, driver.Status)
-	
-	// First try recent location (within 5 min)
+
 	loc, err := services.GetDriverLocation(ctx, driver.ID)
 	if err != nil || loc == nil {
 		log.Printf("driver jobs: get location error driver_id=%s: %v", driver.ID, err)
-		// Try any location for debugging
 		locAny, _ := services.GetDriverLocationAny(ctx, driver.ID)
 		if locAny != nil {
-			log.Printf("driver jobs: found old location lat=%.6f lon=%.6f updated_at=%s, rejecting (older than 5 min)", locAny.Lat, locAny.Lon, locAny.UpdatedAt)
+			log.Printf("driver jobs: found old location lat=%.6f lon=%.6f updated_at=%s", locAny.Lat, locAny.Lon, locAny.UpdatedAt)
 			kb := tgbotapi.NewReplyKeyboard(
 				tgbotapi.NewKeyboardButtonRow(
-					tgbotapi.NewKeyboardButtonLocation("📍 Share Location"),
+					tgbotapi.NewKeyboardButtonLocation(lang.T(l, "dr_share_location")),
 				),
 			)
 			kb.OneTimeKeyboard = false
 			kb.ResizeKeyboard = true
-			msg := tgbotapi.NewMessage(chatID, "❌ Lokatsiyangiz eskirgan yoki yo'q. Iltimos live location yuboring.")
+			msg := tgbotapi.NewMessage(chatID, lang.T(l, "dr_location_stale"))
 			msg.ReplyMarkup = kb
 			d.api.Send(msg)
 			return
 		}
-		log.Printf("driver jobs: no location found at all for driver_id=%s", driver.ID)
-		d.send(chatID, "❌ Lokatsiyangiz eskirgan yoki yo'q. Iltimos live location yuboring.")
+		d.sendLang(chatID, driver.TgUserID, "dr_location_stale")
 		return
 	}
-	
-	// Debug: Log driver location
-	log.Printf("driver jobs: driver location lat=%.6f lon=%.6f updated_at=%s", loc.Lat, loc.Lon, loc.UpdatedAt)
-	
-	// Get radius from config (default 50km for debugging)
+
 	radiusKm := d.config.Delivery.DriverJobsRadius
-	log.Printf("driver jobs: radius_km=%.1f", radiusKm)
-	
-	// Count ready orders before distance filter
-	readyCount, _ := services.CountReadyOrders(ctx)
-	log.Printf("driver jobs: COUNT ready orders (status='ready' AND driver_id IS NULL): %d", readyCount)
-	
-	// Get nearby orders (fetch more for debugging, display top 5)
 	orders, err := services.GetNearbyReadyOrders(ctx, loc.Lat, loc.Lon, radiusKm, 10)
 	if err != nil {
-		log.Printf("driver jobs: query error driver_id=%s: %v", driver.ID, err)
-		d.send(chatID, "Xatolik: "+err.Error())
+		log.Printf("driver jobs: query error: %v", err)
+		d.sendLang(chatID, driver.TgUserID, "dr_error", err.Error())
 		return
 	}
-	
-	log.Printf("driver jobs: COUNT after distance filter: %d", len(orders))
-	
-	// Debug: Log top 3 candidate orders
-	for i, o := range orders {
-		if i >= 3 {
-			break
-		}
-		log.Printf("driver jobs: candidate order #%d: id=%d lat=%.6f lon=%.6f distance_km=%.2f", i+1, o.ID, o.Lat, o.Lon, o.DistanceKm)
-	}
-	
+
 	if len(orders) == 0 {
-		d.send(chatID, "📭 Yaqin atrofda buyurtma topilmadi.")
+		d.sendLang(chatID, driver.TgUserID, "dr_no_jobs")
 		return
 	}
-	
-	// Display top 5 orders
+
 	displayLimit := 5
 	if len(orders) < displayLimit {
 		displayLimit = len(orders)
 	}
-	text := "📋 Yaqin atrofda tayyor buyurtmalar:\n\n"
+	text := lang.T(l, "dr_jobs_header")
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for i := 0; i < displayLimit; i++ {
 		o := orders[i]
-		text += fmt.Sprintf("Buyurtma #%d\n", o.ID)
-		text += fmt.Sprintf("Masofa: %.1f km\n", o.DistanceKm)
-		text += fmt.Sprintf("Jami: %d UZS\n\n", o.GrandTotal)
+		text += fmt.Sprintf(lang.T(l, "dr_order_line"), o.ID)
+		text += fmt.Sprintf(lang.T(l, "dr_order_items"), o.ItemsTotal)
+		text += fmt.Sprintf(lang.T(l, "dr_order_delivery"), o.DeliveryFee)
+		text += fmt.Sprintf(lang.T(l, "dr_order_total"), o.GrandTotal)
+		text += fmt.Sprintf(lang.T(l, "dr_distance"), o.DistanceKm)
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("✅ Accept Order #%d", o.ID), "driver_accept:"+strconv.FormatInt(o.ID, 10)),
+			tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf(lang.T(l, "dr_accept_order"), o.ID), "driver_accept:"+strconv.FormatInt(o.ID, 10)),
 		))
 	}
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("« Back", "driver:back"),
+		tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_back"), "driver:back"),
 	))
 	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
 	d.sendWithInline(chatID, text, kb)
 }
 
 func (d *DriverBot) handleActiveOrder(chatID int64, driver *services.Driver) {
+	l := d.getLang(driver.TgUserID)
+	if l == "" {
+		l = lang.Uz
+	}
 	if driver.Status != services.DriverStatusOnline {
-		d.send(chatID, "❌ Avval \"Go Online\" tugmasini bosing.")
+		d.sendLang(chatID, driver.TgUserID, "dr_please_go_online")
 		return
 	}
 	ctx := context.Background()
 	loc, err := services.GetDriverLocation(ctx, driver.ID)
 	if err != nil || loc == nil {
-		// Try any location
 		locAny, _ := services.GetDriverLocationAny(ctx, driver.ID)
 		if locAny != nil {
-			log.Printf("driver active: using location updated_at=%s", locAny.UpdatedAt)
 			loc = locAny
 		} else {
 			kb := tgbotapi.NewReplyKeyboard(
 				tgbotapi.NewKeyboardButtonRow(
-					tgbotapi.NewKeyboardButtonLocation("📍 Share Location"),
+					tgbotapi.NewKeyboardButtonLocation(lang.T(l, "dr_share_location")),
 				),
 			)
 			kb.OneTimeKeyboard = false
 			kb.ResizeKeyboard = true
-			msg := tgbotapi.NewMessage(chatID, "❌ Lokatsiyangiz topilmadi. Iltimos, lokatsiyangizni ulashing.")
+			msg := tgbotapi.NewMessage(chatID, lang.T(l, "dr_location_stale"))
 			msg.ReplyMarkup = kb
 			d.api.Send(msg)
 			return
@@ -395,68 +435,65 @@ func (d *DriverBot) handleActiveOrder(chatID int64, driver *services.Driver) {
 	}
 	order, err := services.GetDriverActiveOrder(ctx, driver.ID)
 	if err != nil {
-		d.send(chatID, "Xatolik: "+err.Error())
+		d.sendLang(chatID, driver.TgUserID, "dr_error", err.Error())
 		return
 	}
 	if order == nil {
-		d.send(chatID, "📭 Sizda faol buyurtma yo'q.")
+		d.sendLang(chatID, driver.TgUserID, "dr_no_active")
 		return
 	}
-	// Build inline buttons based on current status
 	var rows [][]tgbotapi.InlineKeyboardButton
 	var statusText string
-	
 	switch order.Status {
 	case services.OrderStatusAssigned:
-		statusText = "Buyurtma qabul qilindi"
+		statusText = lang.T(l, "dr_status_accepted")
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📦 Mark Collected", fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusPickedUp)),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_mark_collected"), fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusPickedUp)),
 		))
 	case services.OrderStatusPickedUp:
-		statusText = "Buyurtma olindi"
+		statusText = lang.T(l, "dr_status_picked")
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🛵 Start Delivering", fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusDelivering)),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_start_delivering"), fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusDelivering)),
 		))
 	case services.OrderStatusDelivering:
-		statusText = "Yetkazilmoqda"
+		statusText = lang.T(l, "dr_status_delivering")
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("✅ Order completed", fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusCompleted)),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_order_completed_btn"), fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusCompleted)),
 		))
 	case services.OrderStatusCompleted:
-		statusText = "Yetkazildi"
-		// No buttons for completed orders
+		statusText = lang.T(l, "dr_status_completed")
 	}
-	
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("« Back", "driver:back"),
+		tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_back"), "driver:back"),
 	))
-	
-	text := fmt.Sprintf("📦 Faol buyurtma:\n\nBuyurtma #%d\nJami: %d UZS\nHolat: %s", order.ID, order.GrandTotal, statusText)
+	text := fmt.Sprintf(lang.T(l, "dr_active_header"), order.ID, order.ItemsTotal, order.DeliveryFee, order.GrandTotal, statusText)
 	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
 	d.sendWithInline(chatID, text, kb)
 }
 
 func (d *DriverBot) handleAcceptOrder(chatID int64, driver *services.Driver, orderID int64) {
 	if driver.Status != services.DriverStatusOnline {
-		d.send(chatID, "❌ Faqat online holatda buyurtma qabul qilishingiz mumkin.")
+		d.sendLang(chatID, driver.TgUserID, "dr_only_online_accept")
 		return
 	}
 	ctx := context.Background()
 	order, err := services.AcceptOrder(ctx, orderID, driver.ID, driver.TgUserID)
 	if err != nil {
 		if err.Error() == "bu buyurtma allaqachon olingan" {
-			d.send(chatID, "❌ Bu buyurtma allaqachon olingan.")
+			d.sendLang(chatID, driver.TgUserID, "dr_order_already_taken")
 		} else {
-			d.send(chatID, "❌ "+err.Error())
+			d.sendLang(chatID, driver.TgUserID, "dr_error", err.Error())
 		}
 		return
 	}
-	// Send restaurant location to driver
+	l := d.getLang(driver.TgUserID)
+	if l == "" {
+		l = lang.Uz
+	}
 	if order.LocationID > 0 {
 		restaurantLoc, err := services.GetLocationByID(ctx, order.LocationID)
 		if err == nil && restaurantLoc != nil {
-			// Send text message first
-			d.send(chatID, fmt.Sprintf("📍 Restoran lokatsiyasi: %s", restaurantLoc.Name))
+			d.send(chatID, fmt.Sprintf(lang.T(l, "dr_restaurant_location"), restaurantLoc.Name))
 			// Send location
 			locationMsg := tgbotapi.NewLocation(chatID, restaurantLoc.Lat, restaurantLoc.Lon)
 			if _, err := d.api.Send(locationMsg); err != nil {
@@ -552,22 +589,27 @@ func (d *DriverBot) updateAdminOrderCard(ctx context.Context, orderID int64, dri
 		log.Printf("failed to get order %d for admin card update: %v", orderID, err)
 		return
 	}
-	// Reconstruct order card with driver info
-	statusLabel := strings.ToUpper(o.Status)
+	// Get admin's preferred order language
+	adminLang, _ := services.GetAdminOrderLang(ctx, *adminChatID)
+	if adminLang == "" {
+		adminLang = lang.Uz
+	}
+	var statusLabel string
 	switch o.Status {
 	case services.OrderStatusNew:
-		statusLabel = "NEW"
+		statusLabel = lang.T(adminLang, "adm_status_new")
 	case services.OrderStatusAssigned:
-		statusLabel = "ASSIGNED"
+		statusLabel = lang.T(adminLang, "adm_status_assigned")
 	case services.OrderStatusPickedUp:
-		statusLabel = "PICKED_UP"
+		statusLabel = lang.T(adminLang, "adm_status_picked_up")
 	case services.OrderStatusDelivering:
-		statusLabel = "DELIVERING"
+		statusLabel = lang.T(adminLang, "adm_status_delivering")
 	case services.OrderStatusCompleted:
-		statusLabel = "COMPLETED"
+		statusLabel = lang.T(adminLang, "adm_status_completed")
+	default:
+		statusLabel = strings.ToUpper(o.Status)
 	}
-	text := fmt.Sprintf("Order #%d\n\nTotal: %d UZS\n\nStatus: %s\n\n✅ Driver accepted", 
-		orderID, o.GrandTotal, statusLabel)
+	text := fmt.Sprintf(lang.T(adminLang, "adm_order_id"), orderID) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_total"), o.ItemsTotal) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_status"), statusLabel) + "\n\n" + lang.T(adminLang, "adm_driver_accepted")
 	if driver.Phone != "" {
 		text += fmt.Sprintf("\nPhone: %s", driver.Phone)
 	}
@@ -608,22 +650,20 @@ func (d *DriverBot) handleDriverStatusUpdate(chatID int64, driver *services.Driv
 	ctx := context.Background()
 	err := services.UpdateDriverOrderStatus(ctx, orderID, driver.ID, driver.TgUserID, newStatus)
 	if err != nil {
-		d.send(chatID, "❌ "+err.Error())
+		d.sendLang(chatID, driver.TgUserID, "dr_error", err.Error())
 		return
 	}
 
 	order, _ := services.GetOrder(ctx, orderID)
 	if order == nil {
-		d.send(chatID, "❌ Buyurtma topilmadi.")
+		d.sendLang(chatID, driver.TgUserID, "dr_order_not_found")
 		return
 	}
 
-	// If status is picked_up, send customer delivery location to driver
 	if newStatus == services.OrderStatusPickedUp {
 		customerLat, customerLon, err := services.GetOrderCoordinates(ctx, orderID)
 		if err == nil && customerLat != 0 && customerLon != 0 {
-			// Send text message first
-			d.send(chatID, "📍 Mijoz yetkazib berish manzili")
+			d.sendLang(chatID, driver.TgUserID, "dr_customer_address")
 			// Send location
 			locationMsg := tgbotapi.NewLocation(chatID, customerLat, customerLon)
 			if _, err := d.api.Send(locationMsg); err != nil {
@@ -680,60 +720,64 @@ func (d *DriverBot) handleDriverStatusUpdate(chatID int64, driver *services.Driv
 		if adminChatID != nil && adminMessageID != nil {
 			o, _ := services.GetOrder(ctx, orderID)
 			if o != nil {
-				statusLabel := strings.ToUpper(newStatus)
+				adminLang, _ := services.GetAdminOrderLang(ctx, *adminChatID)
+				if adminLang == "" {
+					adminLang = lang.Uz
+				}
+				var statusLabel string
 				switch newStatus {
 				case services.OrderStatusPickedUp:
-					statusLabel = "PICKED_UP"
+					statusLabel = lang.T(adminLang, "adm_status_picked_up")
 				case services.OrderStatusDelivering:
-					statusLabel = "DELIVERING"
+					statusLabel = lang.T(adminLang, "adm_status_delivering")
 				case services.OrderStatusCompleted:
-					statusLabel = "COMPLETED"
+					statusLabel = lang.T(adminLang, "adm_status_completed")
+				default:
+					statusLabel = strings.ToUpper(newStatus)
 				}
-				text := fmt.Sprintf("Order #%d\n\nTotal: %d UZS\n\nStatus: %s", orderID, o.GrandTotal, statusLabel)
+				text := fmt.Sprintf(lang.T(adminLang, "adm_order_id"), orderID) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_total"), o.ItemsTotal) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_status"), statusLabel)
 				edit := tgbotapi.NewEditMessageText(*adminChatID, *adminMessageID, text)
 				d.messageBot.Send(edit)
 			}
 		}
 	}
 
-	// Refresh active order view - update the message with new status
 	order, _ = services.GetOrder(ctx, orderID)
 	if order != nil && messageID > 0 {
+		l := d.getLang(driver.TgUserID)
+		if l == "" {
+			l = lang.Uz
+		}
 		var rows [][]tgbotapi.InlineKeyboardButton
 		var statusText string
-		
 		switch order.Status {
 		case services.OrderStatusAssigned:
-			statusText = "Buyurtma qabul qilindi"
+			statusText = lang.T(l, "dr_status_accepted")
 			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("📦 Mark Collected", fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusPickedUp)),
+				tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_mark_collected"), fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusPickedUp)),
 			))
 		case services.OrderStatusPickedUp:
-			statusText = "Buyurtma olindi"
+			statusText = lang.T(l, "dr_status_picked")
 			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("🛵 Start Delivering", fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusDelivering)),
+				tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_start_delivering"), fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusDelivering)),
 			))
 		case services.OrderStatusDelivering:
-			statusText = "Yetkazilmoqda"
+			statusText = lang.T(l, "dr_status_delivering")
 			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("✅ Order completed", fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusCompleted)),
+				tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_order_completed_btn"), fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusCompleted)),
 			))
 		case services.OrderStatusCompleted:
-			statusText = "Yetkazildi"
-			// No buttons for completed orders
+			statusText = lang.T(l, "dr_status_completed")
 		}
-		
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("« Back", "driver:back"),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_back"), "driver:back"),
 		))
-		
-		text := fmt.Sprintf("📦 Faol buyurtma:\n\nBuyurtma #%d\nJami: %d UZS\nHolat: %s", order.ID, order.GrandTotal, statusText)
+		text := fmt.Sprintf(lang.T(l, "dr_active_header"), order.ID, order.ItemsTotal, order.DeliveryFee, order.GrandTotal, statusText)
 		kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
 		edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
 		if len(kb.InlineKeyboard) > 0 {
 			edit.ReplyMarkup = &kb
 		} else {
-			// Remove keyboard if empty
 			emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
 			editRemoveKb := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, emptyKb)
 			d.api.Send(editRemoveKb)
@@ -746,18 +790,21 @@ func (d *DriverBot) handleCompleteDelivery(chatID int64, driver *services.Driver
 	ctx := context.Background()
 	err := services.CompleteDeliveryByDriver(ctx, orderID, driver.ID, driver.TgUserID)
 	if err != nil {
-		d.send(chatID, "❌ "+err.Error())
+		d.sendLang(chatID, driver.TgUserID, "dr_error", err.Error())
 		return
 	}
 	order, _ := services.GetOrder(ctx, orderID)
 	if order == nil {
-		d.send(chatID, "❌ Buyurtma topilmadi.")
+		d.sendLang(chatID, driver.TgUserID, "dr_order_not_found")
 		return
 	}
 
-	// Update the message if called from callback
+	l := d.getLang(driver.TgUserID)
+	if l == "" {
+		l = lang.Uz
+	}
 	if messageID > 0 {
-		text := fmt.Sprintf("📦 Faol buyurtma:\n\nBuyurtma #%d\nJami: %d UZS\nHolat: Yetkazildi", order.ID, order.GrandTotal)
+		text := fmt.Sprintf(lang.T(l, "dr_active_header_done"), order.ID, order.ItemsTotal, order.DeliveryFee, order.GrandTotal)
 		emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
 		editRemoveKb := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, emptyKb)
 		d.api.Send(editRemoveKb)
@@ -765,7 +812,7 @@ func (d *DriverBot) handleCompleteDelivery(chatID int64, driver *services.Driver
 		d.api.Send(edit)
 	}
 
-	d.send(chatID, fmt.Sprintf("✅ Buyurtma #%d yetkazib berildi va yakunlandi.", orderID))
+	d.sendLang(chatID, driver.TgUserID, "dr_delivery_completed", orderID)
 	d.sendDriverPanel(chatID, driver)
 
 	// Notify customer
@@ -806,8 +853,11 @@ func (d *DriverBot) handleCompleteDelivery(chatID int64, driver *services.Driver
 		// Update admin order card if message ID exists
 		adminChatID, adminMessageID, _ := services.GetAdminMessageIDs(ctx, orderID)
 		if adminChatID != nil && adminMessageID != nil {
-			statusLabel := "COMPLETED"
-			text := fmt.Sprintf("Order #%d\n\nTotal: %d UZS\n\nStatus: %s", orderID, order.GrandTotal, statusLabel)
+			adminLang, _ := services.GetAdminOrderLang(ctx, *adminChatID)
+			if adminLang == "" {
+				adminLang = lang.Uz
+			}
+			text := fmt.Sprintf(lang.T(adminLang, "adm_order_id"), orderID) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_total"), order.ItemsTotal) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_status"), lang.T(adminLang, "adm_status_completed"))
 			edit := tgbotapi.NewEditMessageText(*adminChatID, *adminMessageID, text)
 			emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
 			editRemoveKb := tgbotapi.NewEditMessageReplyMarkup(*adminChatID, *adminMessageID, emptyKb)

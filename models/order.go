@@ -20,6 +20,8 @@ type Order struct {
 	ChatID       string
 	ItemsTotal   int64
 	GrandTotal   int64
+	DeliveryFee  int64   // taxi-style: base + per km
+	DistanceKm   float64 // for breakdown display
 	DeliveryType *string // 'pickup' or 'delivery', nil if not set
 }
 

@@ -22,18 +22,20 @@ type adderState struct {
 }
 
 type locationAdderState struct {
-	Step           string // "name", "location", "admin_wait", "admin_id", "password"
-	Name           string
-	Lat            float64
-	Lon            float64
-	PendingAdminID int64
+	Step                string // "name", "location", "admin_wait", "admin_id", "password", "order_lang"
+	Name                string
+	Lat                 float64
+	Lon                 float64
+	PendingAdminID      int64
+	PendingPasswordHash string
 }
 
 // addBranchAdminState is for adding a branch admin to an existing location.
 type addBranchAdminState struct {
-	LocationID      int64
-	PendingAdminID  int64
-	Step            string // "admin_id", "password"
+	LocationID          int64
+	PendingAdminID      int64
+	PendingPasswordHash string
+	Step                string // "admin_id", "password", "order_lang"
 }
 
 // AdderBot is the admin bot for adding menu items (uses ADDER_TOKEN). Big admin uses LOGIN; branch admins use their unique password.
@@ -205,8 +207,16 @@ func (a *AdderBot) handleStart(chatID int64, userID int64) {
 		if addFlow != nil {
 			if addFlow.Step == "admin_id" {
 				a.send(chatID, "👤 Send the Telegram user ID of the new branch admin.")
-			} else {
+			} else if addFlow.Step == "password" {
 				a.send(chatID, "🔑 Send the unique password for this branch admin.")
+			} else if addFlow.Step == "order_lang" {
+				kb := tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("O'zbek — buyurtmalar o'zbekcha", "adder:branch_lang:uz"),
+						tgbotapi.NewInlineKeyboardButtonData("Русский — заказы на русском", "adder:branch_lang:ru"),
+					),
+				)
+				a.sendWithInline(chatID, "📩 In which language should this admin receive order notifications? Tap a button below.", kb)
 			}
 			return
 		}
@@ -407,6 +417,29 @@ func (a *AdderBot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		a.stateMu.Unlock()
 		a.send(chatID, "✅ Previous admin(s) removed. Send the Telegram user ID of the new branch admin for this place.\n\n💡 User can get their ID via @userinfobot. Cancel: /cancel")
 		return
+	case strings.HasPrefix(data, "adder:branch_lang:"):
+		// Language choice for branch admin order notifications (after password step)
+		langCode := strings.TrimPrefix(data, "adder:branch_lang:")
+		if langCode != "uz" && langCode != "ru" {
+			return
+		}
+		a.stateMu.Lock()
+		ab := a.addBranchAdmin[userID]
+		a.stateMu.Unlock()
+		if ab == nil || ab.Step != "order_lang" || ab.PendingPasswordHash == "" {
+			a.send(chatID, "❌ Session expired. Please start again from Add Branch Admin.")
+			return
+		}
+		ctx := context.Background()
+		if err := services.AddBranchAdmin(ctx, ab.LocationID, ab.PendingAdminID, userID, ab.PendingPasswordHash, langCode); err != nil {
+			a.send(chatID, "❌ Failed to add branch admin: "+err.Error())
+		} else {
+			a.send(chatID, fmt.Sprintf("✅ Branch admin (user ID %d) added. Order notifications will be in %s.", ab.PendingAdminID, map[string]string{"uz": "Uzbek", "ru": "Russian"}[langCode]))
+		}
+		a.stateMu.Lock()
+		delete(a.addBranchAdmin, userID)
+		a.stateMu.Unlock()
+		return
 	case strings.HasPrefix(data, "adder:list:"):
 		if a.getRole(userID) != "branch" {
 			a.send(chatID, "Only branch admins can manage menu items. Big admin only manages locations.")
@@ -460,6 +493,33 @@ func (a *AdderBot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		a.stateMu.Unlock()
 		a.send(chatID, "❌ Cancelled. Location was not saved because no admin was assigned.")
 		a.sendAdminPanel(chatID, userID)
+		return
+	case strings.HasPrefix(data, "adder:loc_lang:"):
+		// Language for new location's branch admin order notifications
+		langCode := strings.TrimPrefix(data, "adder:loc_lang:")
+		if langCode != "uz" && langCode != "ru" {
+			return
+		}
+		a.stateMu.Lock()
+		st := a.locState[userID]
+		a.stateMu.Unlock()
+		if st == nil || st.Step != "order_lang" || st.PendingPasswordHash == "" {
+			a.send(chatID, "❌ Session expired. Please start again from Add Fast Food Location.")
+			return
+		}
+		ctx := context.Background()
+		locID, err := services.CreateLocationWithAdmin(ctx, st.Name, st.Lat, st.Lon, st.PendingAdminID, userID, st.PendingPasswordHash, langCode)
+		if err != nil {
+			a.send(chatID, "Failed to save location + admin: "+err.Error())
+			log.Printf("failed to create location with admin (name=%q): %v", st.Name, err)
+		} else {
+			a.send(chatID, fmt.Sprintf("✅ Saved fast food location \"%s\" (id %d) and assigned admin. Order notifications will be in %s.", st.Name, locID, map[string]string{"uz": "Uzbek", "ru": "Russian"}[langCode]))
+		}
+		a.stateMu.Lock()
+		delete(a.locState, userID)
+		a.activeLocation[userID] = locID
+		a.stateMu.Unlock()
+		a.clearLoggedIn(userID)
 		return
 	case strings.HasPrefix(data, "adder:setloc:"):
 		idStr := strings.TrimPrefix(data, "adder:setloc:")
@@ -605,19 +665,21 @@ func (a *AdderBot) handleAddBranchAdminFlow(msg *tgbotapi.Message, userID int64,
 			a.send(msg.Chat.ID, "❌ Invalid password: "+err.Error())
 			return true
 		}
-		ctx := context.Background()
-		if err := services.AddBranchAdmin(ctx, ab.LocationID, ab.PendingAdminID, userID, passwordHash); err != nil {
-			a.send(msg.Chat.ID, "❌ Failed to add branch admin: "+err.Error())
-			a.stateMu.Lock()
-			delete(a.addBranchAdmin, userID)
-			a.stateMu.Unlock()
-			return true
-		}
 		a.stateMu.Lock()
-		delete(a.addBranchAdmin, userID)
+		a.addBranchAdmin[userID] = &addBranchAdminState{
+			LocationID:          ab.LocationID,
+			PendingAdminID:      ab.PendingAdminID,
+			PendingPasswordHash: passwordHash,
+			Step:                "order_lang",
+		}
 		a.stateMu.Unlock()
-		a.send(msg.Chat.ID, fmt.Sprintf("✅ Branch admin (user ID %d) added. Send your password to continue.", ab.PendingAdminID))
-		a.clearLoggedIn(userID)
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("O'zbek — buyurtmalar o'zbekcha", "adder:branch_lang:uz"),
+				tgbotapi.NewInlineKeyboardButtonData("Русский — заказы на русском", "adder:branch_lang:ru"),
+			),
+		)
+		a.sendWithInline(msg.Chat.ID, "📩 In which language should this admin receive order notifications?\n\nQaysi tilda ushbu admin buyurtma xabarlarini olsin?", kb)
 		return true
 	}
 	return false
@@ -727,19 +789,18 @@ func (a *AdderBot) handleLocationAddFlow(msg *tgbotapi.Message, userID int64, te
 			a.send(msg.Chat.ID, "❌ Invalid password: "+err.Error())
 			return true
 		}
-		ctx := context.Background()
-		locID, err := services.CreateLocationWithAdmin(ctx, st.Name, st.Lat, st.Lon, st.PendingAdminID, userID, passwordHash)
-		if err != nil {
-			a.send(msg.Chat.ID, "Failed to save location + admin: "+err.Error())
-			log.Printf("failed to create location with admin (name=%q): %v", st.Name, err)
-			return true
-		}
+		st.PendingPasswordHash = passwordHash
+		st.Step = "order_lang"
 		a.stateMu.Lock()
-		delete(a.locState, userID)
-		a.activeLocation[userID] = locID
+		a.locState[userID] = st
 		a.stateMu.Unlock()
-		a.send(msg.Chat.ID, fmt.Sprintf("✅ Saved fast food location \"%s\" (id %d) and assigned admin. Send your password to continue.", st.Name, locID))
-		a.clearLoggedIn(userID)
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("O'zbek — buyurtmalar o'zbekcha", "adder:loc_lang:uz"),
+				tgbotapi.NewInlineKeyboardButtonData("Русский — заказы на русском", "adder:loc_lang:ru"),
+			),
+		)
+		a.sendWithInline(msg.Chat.ID, "📩 In which language should this admin receive order notifications?\n\nQaysi tilda ushbu admin buyurtma xabarlarini olsin?", kb)
 		return true
 	default:
 		return false

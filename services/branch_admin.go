@@ -17,29 +17,28 @@ func EnsureBranchAdminsTable(ctx context.Context) error {
 	if err := db.Pool.QueryRow(ctx, `SELECT to_regclass('public.branch_admins')`).Scan(&regclass); err != nil {
 		return fmt.Errorf("check branch_admins table existence: %w", err)
 	}
-	if regclass != nil {
-		return nil
-	}
+	if regclass == nil {
+		_, err := db.Pool.Exec(ctx, `
+			CREATE TABLE IF NOT EXISTS branch_admins (
+				id BIGSERIAL PRIMARY KEY,
+				branch_location_id BIGINT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+				branch_name TEXT NOT NULL DEFAULT '',
+				admin_user_id BIGINT NOT NULL,
+				promoted_by BIGINT NOT NULL,
+				promoted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+				password_hash TEXT,
+				UNIQUE(branch_location_id)
+			);
 
-	// Create table + indexes (idempotent enough to run once at startup). One admin per location.
-	_, err := db.Pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS branch_admins (
-			id BIGSERIAL PRIMARY KEY,
-			branch_location_id BIGINT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
-			branch_name TEXT NOT NULL DEFAULT '',
-			admin_user_id BIGINT NOT NULL,
-			promoted_by BIGINT NOT NULL,
-			promoted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			password_hash TEXT,
-			UNIQUE(branch_location_id)
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_branch_admins_location ON branch_admins(branch_location_id);
-		CREATE INDEX IF NOT EXISTS idx_branch_admins_admin ON branch_admins(admin_user_id);
-	`)
-	if err != nil {
-		return fmt.Errorf("create branch_admins table: %w", err)
+			CREATE INDEX IF NOT EXISTS idx_branch_admins_location ON branch_admins(branch_location_id);
+			CREATE INDEX IF NOT EXISTS idx_branch_admins_admin ON branch_admins(admin_user_id);
+		`)
+		if err != nil {
+			return fmt.Errorf("create branch_admins table: %w", err)
+		}
 	}
+	// Add order_lang column if missing (admin receives order cards in this language: uz or ru)
+	_, _ = db.Pool.Exec(ctx, `ALTER TABLE branch_admins ADD COLUMN IF NOT EXISTS order_lang VARCHAR(2) NOT NULL DEFAULT 'uz'`)
 	return nil
 }
 
@@ -103,12 +102,16 @@ func AuthenticateBranchAdmin(ctx context.Context, userID int64, plainPassword st
 }
 
 // AddBranchAdmin adds a new admin for a specific branch with a unique password (hash).
-func AddBranchAdmin(ctx context.Context, branchLocationID int64, adminUserID int64, promotedBy int64, passwordHash string) error {
+// orderLang is the language in which this admin receives order cards: "uz" or "ru" (default "uz" if empty).
+func AddBranchAdmin(ctx context.Context, branchLocationID int64, adminUserID int64, promotedBy int64, passwordHash string, orderLang string) error {
 	if err := EnsureBranchAdminsTable(ctx); err != nil {
 		return err
 	}
 	if passwordHash == "" {
 		return fmt.Errorf("password is required for branch admin")
+	}
+	if orderLang != "ru" {
+		orderLang = "uz"
 	}
 
 	// Validate that the branch location exists
@@ -139,17 +142,17 @@ func AddBranchAdmin(ctx context.Context, branchLocationID int64, adminUserID int
 		return fmt.Errorf("failed to read branch name (location_id=%d): %w", branchLocationID, err)
 	}
 
-	// One admin per location: upsert by branch_location_id (replaces existing admin if any)
 	_, err = db.Pool.Exec(ctx, `
-		INSERT INTO branch_admins (branch_location_id, branch_name, admin_user_id, promoted_by, password_hash)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO branch_admins (branch_location_id, branch_name, admin_user_id, promoted_by, password_hash, order_lang)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (branch_location_id) DO UPDATE SET
 			branch_name = EXCLUDED.branch_name,
 			admin_user_id = EXCLUDED.admin_user_id,
 			promoted_by = EXCLUDED.promoted_by,
 			password_hash = EXCLUDED.password_hash,
+			order_lang = EXCLUDED.order_lang,
 			promoted_at = now()`,
-		branchLocationID, branchName, adminUserID, promotedBy, passwordHash,
+		branchLocationID, branchName, adminUserID, promotedBy, passwordHash, orderLang,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to add branch admin (location_id=%d, admin_user_id=%d): %w", branchLocationID, adminUserID, err)
@@ -198,6 +201,58 @@ func GetBranchAdmins(ctx context.Context, branchLocationID int64) ([]int64, erro
 		adminIDs = append(adminIDs, adminID)
 	}
 	return adminIDs, rows.Err()
+}
+
+// BranchAdminWithLang is an admin user ID and the language they receive order cards in.
+type BranchAdminWithLang struct {
+	AdminUserID int64
+	OrderLang   string // "uz" or "ru"
+}
+
+// GetBranchAdminsWithLang returns all admins for a branch with their order_lang (for per-admin localized order cards).
+func GetBranchAdminsWithLang(ctx context.Context, branchLocationID int64) ([]BranchAdminWithLang, error) {
+	if err := EnsureBranchAdminsTable(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := db.Pool.Query(ctx, `
+		SELECT admin_user_id, COALESCE(NULLIF(TRIM(order_lang), ''), 'uz') FROM branch_admins WHERE branch_location_id = $1`,
+		branchLocationID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get branch admins with lang: %w", err)
+	}
+	defer rows.Close()
+	var out []BranchAdminWithLang
+	for rows.Next() {
+		var a BranchAdminWithLang
+		if err := rows.Scan(&a.AdminUserID, &a.OrderLang); err != nil {
+			return nil, err
+		}
+		if a.OrderLang != "ru" {
+			a.OrderLang = "uz"
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// GetAdminOrderLang returns the order card language for an admin user ("uz" or "ru"). Returns "uz" if not found.
+func GetAdminOrderLang(ctx context.Context, adminUserID int64) (string, error) {
+	if err := EnsureBranchAdminsTable(ctx); err != nil {
+		return "uz", err
+	}
+	var orderLang string
+	err := db.Pool.QueryRow(ctx, `SELECT COALESCE(NULLIF(TRIM(order_lang), ''), 'uz') FROM branch_admins WHERE admin_user_id = $1 LIMIT 1`, adminUserID).Scan(&orderLang)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "uz", nil
+		}
+		return "uz", err
+	}
+	if orderLang != "ru" {
+		orderLang = "uz"
+	}
+	return orderLang, nil
 }
 
 // RemoveBranchAdmin removes an admin from a branch

@@ -23,6 +23,7 @@ type Order struct {
 	DeliveryFee  int64   // taxi-style: base + per km
 	DistanceKm   float64 // for breakdown display
 	DeliveryType *string // 'pickup' or 'delivery', nil if not set
+	DriverID     *string // set when driver accepted
 }
 
 type OverrideDeliveryFeeInput struct {

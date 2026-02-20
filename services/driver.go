@@ -216,6 +216,54 @@ func GetNearbyReadyOrders(ctx context.Context, driverLat, driverLon float64, rad
 	return orders, rows.Err()
 }
 
+// NearbyDriverForPush is a driver candidate to receive a READY order push (chat_id for Telegram, distance in km).
+type NearbyDriverForPush struct {
+	DriverID   string
+	ChatID     int64
+	DistanceKm float64
+}
+
+// GetNearbyOnlineDriversForOrder returns up to limit drivers who are online, have location updated within last 5 minutes,
+// and are within radiusKm of (orderLat, orderLon). Ordered by distance ascending. Used to push READY orders to drivers.
+func GetNearbyOnlineDriversForOrder(ctx context.Context, orderLat, orderLon float64, radiusKm float64, limit int) ([]NearbyDriverForPush, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := db.Pool.Query(ctx, `
+		SELECT d.id, d.chat_id,
+		       (6371 * acos(
+		           cos(radians($1)) * cos(radians(dl.lat)) *
+		           cos(radians(dl.lon) - radians($2)) +
+		           sin(radians($1)) * sin(radians(dl.lat))
+		       )) AS distance_km
+		FROM drivers d
+		INNER JOIN driver_locations dl ON dl.driver_id = d.id
+		  AND dl.updated_at >= now() - interval '5 minutes'
+		WHERE d.status = $3
+		  AND (6371 * acos(
+		      cos(radians($1)) * cos(radians(dl.lat)) *
+		      cos(radians(dl.lon) - radians($2)) +
+		      sin(radians($1)) * sin(radians(dl.lat))
+		  )) <= $4
+		ORDER BY distance_km ASC
+		LIMIT $5`,
+		orderLat, orderLon, DriverStatusOnline, radiusKm, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NearbyDriverForPush
+	for rows.Next() {
+		var r NearbyDriverForPush
+		if err := rows.Scan(&r.DriverID, &r.ChatID, &r.DistanceKm); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // AcceptOrder assigns a driver to a READY order and transitions status to 'assigned' (atomic, prevents double assign).
 // Returns order details if successful, error if already assigned or invalid.
 func AcceptOrder(ctx context.Context, orderID int64, driverID string, driverTgUserID int64) (*models.Order, error) {

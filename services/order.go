@@ -93,12 +93,13 @@ func CreateOrder(ctx context.Context, input models.CreateOrderInput) (int64, err
 func GetOrder(ctx context.Context, orderID int64) (*models.Order, error) {
 	var o models.Order
 	var deliveryType *string
+	var driverID *string
 	err := db.Pool.QueryRow(ctx, `
 		SELECT id, COALESCE(location_id, 0), status, chat_id, items_total, grand_total,
-		       COALESCE(delivery_fee, 0), COALESCE(distance_km, 0), delivery_type
+		       COALESCE(delivery_fee, 0), COALESCE(distance_km, 0), delivery_type, driver_id
 		FROM orders WHERE id = $1`,
 		orderID,
-	).Scan(&o.ID, &o.LocationID, &o.Status, &o.ChatID, &o.ItemsTotal, &o.GrandTotal, &o.DeliveryFee, &o.DistanceKm, &deliveryType)
+	).Scan(&o.ID, &o.LocationID, &o.Status, &o.ChatID, &o.ItemsTotal, &o.GrandTotal, &o.DeliveryFee, &o.DistanceKm, &deliveryType, &driverID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -106,6 +107,7 @@ func GetOrder(ctx context.Context, orderID int64) (*models.Order, error) {
 		return nil, err
 	}
 	o.DeliveryType = deliveryType
+	o.DriverID = driverID
 	return &o, nil
 }
 
@@ -119,6 +121,50 @@ func GetOrderCoordinates(ctx context.Context, orderID int64) (lat, lon float64, 
 		return 0, 0, err
 	}
 	return lat, lon, nil
+}
+
+// TrySetOrderPushedAt sets orders.pushed_at = NOW() only if pushed_at IS NULL (one-shot claim for driver push).
+// Returns true if we claimed (row updated), false if already set.
+func TrySetOrderPushedAt(ctx context.Context, orderID int64) (claimed bool, err error) {
+	var id int64
+	err = db.Pool.QueryRow(ctx, `UPDATE orders SET pushed_at = now() WHERE id = $1 AND pushed_at IS NULL RETURNING id`, orderID).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// OrderPushedWithinSeconds returns true if order has pushed_at set and within the last sec seconds.
+func OrderPushedWithinSeconds(ctx context.Context, orderID int64, sec int) (bool, error) {
+	if sec <= 0 {
+		sec = 60
+	}
+	var within bool
+	err := db.Pool.QueryRow(ctx, `SELECT pushed_at IS NOT NULL AND pushed_at >= now() - ($1::text || ' seconds')::interval FROM orders WHERE id = $2`, sec, orderID).Scan(&within)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return within, nil
+}
+
+// OrderAvailableForPush returns true if order is still status='ready' and driver_id IS NULL (not yet accepted).
+func OrderAvailableForPush(ctx context.Context, orderID int64) (bool, error) {
+	var status string
+	var driverID *string
+	err := db.Pool.QueryRow(ctx, `SELECT status, driver_id FROM orders WHERE id = $1`, orderID).Scan(&status, &driverID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return status == OrderStatusReady && driverID == nil, nil
 }
 
 // validStatusTransition defines allowed order status changes (no skip).

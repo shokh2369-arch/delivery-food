@@ -96,10 +96,11 @@ type checkoutState struct {
 }
 
 type Bot struct {
-	api        *tgbotapi.BotAPI
-	messageBot *tgbotapi.BotAPI // bot for sending order notifications (MESSAGE_TOKEN)
-	cfg        *config.Config
-	admin      int64
+	api          *tgbotapi.BotAPI
+	messageBot   *tgbotapi.BotAPI // bot for sending order notifications (MESSAGE_TOKEN)
+	driverBotAPI *tgbotapi.BotAPI // for pushing READY orders to nearby drivers (DRIVER_BOT_TOKEN)
+	cfg          *config.Config
+	admin        int64
 
 	locSuggestions   map[int64][]services.LocationWithDistance
 	locSuggestionsMu sync.RWMutex
@@ -109,6 +110,8 @@ type Bot struct {
 
 	userLang   map[int64]string // "uz" or "ru"
 	userLangMu sync.RWMutex
+
+	orderLocks sync.Map // map[orderID]*sync.Mutex, for per-order locking in RefreshOrderCards
 }
 
 func New(cfg *config.Config, adminUserID int64) (*Bot, error) {
@@ -144,6 +147,176 @@ func (b *Bot) GetAPI() *tgbotapi.BotAPI {
 // GetMessageBot returns the message bot API (for driver bot to send admin notifications).
 func (b *Bot) GetMessageBot() *tgbotapi.BotAPI {
 	return b.messageBot
+}
+
+// SetDriverBotAPI sets the driver bot API so this bot can push READY orders to nearby drivers.
+func (b *Bot) SetDriverBotAPI(api *tgbotapi.BotAPI) {
+	b.driverBotAPI = api
+}
+
+// apiForAudience returns the bot API used to send/edit messages for the given audience.
+func (b *Bot) apiForAudience(audience string) *tgbotapi.BotAPI {
+	switch audience {
+	case "admin":
+		return b.messageBot
+	case "customer":
+		return b.api
+	case "driver":
+		return b.driverBotAPI
+	default:
+		return b.api
+	}
+}
+
+// cardMarkup converts OrderCardContent.Buttons to Telegram inline keyboard (URL vs callback).
+func cardMarkup(c services.OrderCardContent) *tgbotapi.InlineKeyboardMarkup {
+	if len(c.Buttons) == 0 {
+		return nil
+	}
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for _, row := range c.Buttons {
+		var btns []tgbotapi.InlineKeyboardButton
+		for _, btn := range row {
+			if btn.URL != "" {
+				btns = append(btns, tgbotapi.NewInlineKeyboardButtonURL(btn.Text, btn.URL))
+			} else {
+				btns = append(btns, tgbotapi.NewInlineKeyboardButtonData(btn.Text, btn.CallbackData))
+			}
+		}
+		rows = append(rows, btns)
+	}
+	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
+	return &kb
+}
+
+// UpsertOrderCard edits the existing order card message if we have a pointer; otherwise sends new and saves pointer.
+// On "message not found" (e.g. deleted): send new message and upsert pointer.
+// On "message is not modified": ignore.
+func (b *Bot) UpsertOrderCard(ctx context.Context, audience string, orderID int64, chatID int64, content services.OrderCardContent) {
+	api := b.apiForAudience(audience)
+	if api == nil {
+		return
+	}
+	chatIDPtr, messageID, ok, err := services.GetOrderMessagePointer(ctx, orderID, audience)
+	if err != nil {
+		log.Printf("UpsertOrderCard get pointer order_id=%d audience=%s: %v", orderID, audience, err)
+		return
+	}
+	if ok {
+		edit := tgbotapi.NewEditMessageText(chatIDPtr, messageID, content.Text)
+		edit.ParseMode = ""
+		if kb := cardMarkup(content); kb != nil {
+			edit.ReplyMarkup = kb
+		} else {
+			emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
+			edit.ReplyMarkup = &emptyKb
+		}
+		_, err = api.Send(edit)
+		if err != nil {
+			errStr := err.Error()
+			if strings.Contains(errStr, "not found") || strings.Contains(errStr, "message to edit not found") {
+				// Fallback: send new and update pointer
+				msg := tgbotapi.NewMessage(chatIDPtr, content.Text)
+				if kb := cardMarkup(content); kb != nil {
+					msg.ReplyMarkup = *kb
+				}
+				sent, sendErr := api.Send(msg)
+				if sendErr != nil {
+					log.Printf("UpsertOrderCard fallback send order_id=%d audience=%s: %v", orderID, audience, sendErr)
+					return
+				}
+				_ = services.UpsertOrderMessagePointer(ctx, orderID, audience, chatIDPtr, sent.MessageID)
+				return
+			}
+			if strings.Contains(errStr, "not modified") {
+				return
+			}
+			log.Printf("UpsertOrderCard edit order_id=%d audience=%s: %v", orderID, audience, err)
+			return
+		}
+		_ = services.UpsertOrderMessagePointer(ctx, orderID, audience, chatIDPtr, messageID)
+		return
+	}
+	// No pointer: send new and save
+	msg := tgbotapi.NewMessage(chatID, content.Text)
+	if kb := cardMarkup(content); kb != nil {
+		msg.ReplyMarkup = *kb
+	}
+	sent, err := api.Send(msg)
+	if err != nil {
+		log.Printf("UpsertOrderCard send order_id=%d audience=%s: %v", orderID, audience, err)
+		return
+	}
+	_ = services.UpsertOrderMessagePointer(ctx, orderID, audience, chatID, sent.MessageID)
+}
+
+// AnswerCallbackQuery sends a short toast for the callback (no new message).
+func (b *Bot) AnswerCallbackQuery(callbackQueryID, text string) {
+	if b.messageBot != nil {
+		b.messageBot.Request(tgbotapi.NewCallback(callbackQueryID, text))
+	}
+}
+
+// lockOrder locks by orderID and returns an unlock function. Used to prevent concurrent edits of the same order cards.
+func (b *Bot) lockOrder(orderID int64) func() {
+	v, _ := b.orderLocks.LoadOrStore(orderID, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// RefreshOrderCards updates the order card for admin, customer, and (if assigned) driver. Call after any order change (e.g. from driver bot).
+func (b *Bot) RefreshOrderCards(ctx context.Context, orderID int64) {
+	unlock := b.lockOrder(orderID)
+	defer unlock()
+
+	o, err := services.GetOrder(ctx, orderID)
+	if err != nil || o == nil {
+		return
+	}
+	var driver *services.Driver
+	if o.DriverID != nil && *o.DriverID != "" {
+		driver, _ = services.GetDriverByID(ctx, *o.DriverID)
+	}
+
+	// Admin card: chat from pointer or first branch admin
+	adminChatID, _, ok, _ := services.GetOrderMessagePointer(ctx, orderID, "admin")
+	if !ok {
+		admins, _ := services.GetBranchAdmins(ctx, o.LocationID)
+		if len(admins) > 0 {
+			adminChatID = admins[0]
+		}
+	}
+	if adminChatID != 0 {
+		adminLang, _ := services.GetAdminOrderLang(ctx, adminChatID)
+		if adminLang == "" {
+			adminLang = lang.Uz
+		}
+		content := services.BuildAdminCard(o, driver, adminLang)
+		b.UpsertOrderCard(ctx, "admin", orderID, adminChatID, content)
+	}
+
+	// Customer card
+	if o.ChatID != "" {
+		if customerChatID, parseErr := strconv.ParseInt(o.ChatID, 10, 64); parseErr == nil {
+			var trackURL string
+			if o.Status == services.OrderStatusDelivering && driver != nil {
+				loc, _ := services.GetDriverLocation(ctx, driver.ID)
+				if loc != nil {
+					trackURL = fmt.Sprintf("https://www.google.com/maps?q=%f,%f", loc.Lat, loc.Lon)
+				}
+			}
+			content := services.BuildCustomerCard(o, driver, trackURL)
+			b.UpsertOrderCard(ctx, "customer", orderID, customerChatID, content)
+		}
+	}
+
+	// Driver card (only when driver assigned)
+	if driver != nil {
+		driverLang := lang.Uz
+		content := services.BuildDriverCard(o, driverLang)
+		b.UpsertOrderCard(ctx, "driver", orderID, driver.ChatID, content)
+	}
 }
 
 func (b *Bot) Start() {
@@ -925,17 +1098,22 @@ func (b *Bot) handleContact(chatID int64, userID int64, phone string, customerUs
 	confirmMsg += lang.T(l, "order_total", itemsTotal+deliveryFee)
 	b.removeKeyboard(chatID, confirmMsg)
 
-	// Send order card only to that restaurant's admin (with status buttons)
-	b.notifyAdmin(id, phone, items, itemsTotal, deliveryFee, distanceKm, customerUsername, userLocation, userLat, userLon, hasUserLocation)
+	o, _ := services.GetOrder(ctx, id)
+	if o != nil {
+		b.UpsertOrderCard(ctx, "customer", id, chatID, services.BuildCustomerCard(o, nil, ""))
+	}
+	// One evolving admin card (first branch admin)
+	b.notifyAdmin(ctx, id, userLocation, userLat, userLon, hasUserLocation)
 }
 
-func (b *Bot) notifyAdmin(orderID int64, phone string, items []cartItem, itemsTotal, deliveryFee int64, distanceKm float64, customerUsername string, location *models.Location, userLat, userLon float64, hasUserLocation bool) {
+func (b *Bot) notifyAdmin(ctx context.Context, orderID int64, location *models.Location, userLat, userLon float64, hasUserLocation bool) {
 	if b.messageBot == nil {
-		return // MESSAGE_TOKEN not set or failed to initialize
+		return
 	}
-
-	ctx := context.Background()
-	// Get branch admins with their preferred order language
+	o, _ := services.GetOrder(ctx, orderID)
+	if o == nil {
+		return
+	}
 	var admins []services.BranchAdminWithLang
 	if location != nil {
 		var err error
@@ -944,7 +1122,6 @@ func (b *Bot) notifyAdmin(orderID int64, phone string, items []cartItem, itemsTo
 			log.Printf("failed to get branch admins for location %d: %v", location.ID, err)
 		}
 	}
-	// Fallback to main admin if no branch admins
 	if len(admins) == 0 && b.admin != 0 {
 		orderLang, _ := services.GetAdminOrderLang(ctx, b.admin)
 		admins = []services.BranchAdminWithLang{{AdminUserID: b.admin, OrderLang: orderLang}}
@@ -953,43 +1130,16 @@ func (b *Bot) notifyAdmin(orderID int64, phone string, items []cartItem, itemsTo
 		log.Printf("warning: no branch admins for order #%d", orderID)
 		return
 	}
-
-	// Send localized order card to each admin
-	for _, admin := range admins {
-		adminLang := admin.OrderLang
-		if adminLang == "" {
-			adminLang = lang.Uz
-		}
-
-		// Build order card text in admin's language
-		customerLabel := lang.T(adminLang, "adm_customer_no_user")
-		if customerUsername != "" {
-			customerLabel = fmt.Sprintf(lang.T(adminLang, "adm_customer"), customerUsername)
-		}
-		text := fmt.Sprintf(lang.T(adminLang, "adm_new_order"), orderID) + "\n" + customerLabel + "\n\n" + lang.T(adminLang, "adm_items") + "\n"
-		for _, it := range items {
-			text += fmt.Sprintf("- %s x%d\n", it.Name, it.Qty)
-		}
-		text += fmt.Sprintf("\n%s\n\n%s", fmt.Sprintf(lang.T(adminLang, "adm_total"), itemsTotal), fmt.Sprintf(lang.T(adminLang, "adm_status"), lang.T(adminLang, "adm_status_new")))
-
-		// Buttons in admin's language
-		kb := b.orderStatusKeyboard(orderID, services.OrderStatusNew, nil, adminLang)
-
-		msg := tgbotapi.NewMessage(admin.AdminUserID, text)
-		msg.ReplyMarkup = kb
-		sentMsg, err := b.messageBot.Send(msg)
-		if err != nil {
-			log.Printf("failed to send order card to admin %d: %v", admin.AdminUserID, err)
-			continue
-		}
-		// Store admin message ID for this order
-		if err := services.SetAdminMessageID(ctx, orderID, admin.AdminUserID, sentMsg.MessageID); err != nil {
-			log.Printf("failed to store admin message ID for order %d: %v", orderID, err)
-		}
-		if hasUserLocation {
-			locMsg := tgbotapi.NewLocation(admin.AdminUserID, userLat, userLon)
-			_, _ = b.messageBot.Send(locMsg)
-		}
+	first := admins[0]
+	adminLang := first.OrderLang
+	if adminLang == "" {
+		adminLang = lang.Uz
+	}
+	content := services.BuildAdminCard(o, nil, adminLang)
+	b.UpsertOrderCard(ctx, "admin", orderID, first.AdminUserID, content)
+	if hasUserLocation {
+		locMsg := tgbotapi.NewLocation(first.AdminUserID, userLat, userLon)
+		_, _ = b.messageBot.Send(locMsg)
 	}
 }
 
@@ -1083,90 +1233,73 @@ func (b *Bot) handleOrderStatusCallback(cq *tgbotapi.CallbackQuery) {
 
 	err = services.UpdateOrderStatus(ctx, orderID, newStatus, adminLocID, adminUserID)
 	if err != nil {
-		// 403 / 400: return error to admin via callback
 		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, err.Error()))
 		log.Printf("order status update failed: order=%d status=%s admin=%d: %v", orderID, newStatus, adminUserID, err)
 		return
 	}
-	b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "✅ Status updated."))
+	b.AnswerCallbackQuery(cq.ID, "✅ Status updated.")
+	b.RefreshOrderCards(ctx, orderID)
+}
 
-	// Get admin's preferred order language
-	adminLang, _ := services.GetAdminOrderLang(ctx, adminUserID)
-	if adminLang == "" {
-		adminLang = lang.Uz
-	}
+// pushReadyOrderToDrivers finds nearby online drivers and sends them a Telegram message with an Accept button.
+// Uses a 10s timeout. Claims pushed_at once; skips if already pushed within 60s. Aborts loop if order no longer available.
+func (b *Bot) pushReadyOrderToDrivers(ctx context.Context, orderID int64) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 
-	// Edit admin message: replace Status line and update keyboard
-	var statusLabel string
-	switch newStatus {
-	case services.OrderStatusNew:
-		statusLabel = lang.T(adminLang, "adm_status_new")
-	case services.OrderStatusPreparing:
-		statusLabel = lang.T(adminLang, "adm_status_preparing")
-	case services.OrderStatusReady:
-		statusLabel = lang.T(adminLang, "adm_status_ready")
-	case services.OrderStatusAssigned:
-		statusLabel = lang.T(adminLang, "adm_status_assigned")
-	case services.OrderStatusPickedUp:
-		statusLabel = lang.T(adminLang, "adm_status_picked_up")
-	case services.OrderStatusDelivering:
-		statusLabel = lang.T(adminLang, "adm_status_delivering")
-	case services.OrderStatusCompleted:
-		statusLabel = lang.T(adminLang, "adm_status_completed")
-	case services.OrderStatusRejected:
-		statusLabel = lang.T(adminLang, "adm_status_rejected")
-	default:
-		statusLabel = strings.ToUpper(newStatus)
+	claimed, err := services.TrySetOrderPushedAt(ctx, orderID)
+	if err != nil {
+		log.Printf("push order to drivers: claim pushed_at failed order_id=%d: %v", orderID, err)
+		return
 	}
-	newText := replaceOrderStatusInMessage(cq.Message.Text, fmt.Sprintf(lang.T(adminLang, "adm_status"), statusLabel))
-	// Get order to check delivery_type
-	o, _ := services.GetOrder(ctx, orderID)
-	var deliveryType *string
-	if o != nil {
-		deliveryType = o.DeliveryType
-	}
-	kb := b.orderStatusKeyboard(orderID, newStatus, deliveryType, adminLang)
-	edit := tgbotapi.NewEditMessageText(cq.Message.Chat.ID, cq.Message.MessageID, newText)
-	// Only set ReplyMarkup if keyboard has buttons (Telegram doesn't accept empty keyboards)
-	if len(kb.InlineKeyboard) > 0 {
-		edit.ReplyMarkup = &kb
-		if _, err := b.messageBot.Send(edit); err != nil {
-			log.Printf("edit order message: %v", err)
+	if !claimed {
+		within, _ := services.OrderPushedWithinSeconds(ctx, orderID, 60)
+		if within {
+			log.Printf("push order to drivers: order_id=%d skipped due to pushed_at (already pushed within 60s)", orderID)
 		}
-	} else {
-		// Remove keyboard by editing with explicitly empty keyboard array
-		emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
-		editRemoveKb := tgbotapi.NewEditMessageReplyMarkup(cq.Message.Chat.ID, cq.Message.MessageID, emptyKb)
-		if _, err := b.messageBot.Send(editRemoveKb); err != nil {
-			log.Printf("remove keyboard from order message: %v", err)
-		}
-		// Then send text edit without keyboard
-		if _, err := b.messageBot.Send(edit); err != nil {
-			log.Printf("edit order message: %v", err)
-		}
+		return
 	}
 
-	// Notify customer (preparing / ready / completed / rejected) after DB commit; de-dup within 30s
-	if newStatus == services.OrderStatusPreparing || newStatus == services.OrderStatusReady || newStatus == services.OrderStatusCompleted || newStatus == services.OrderStatusRejected {
-		o, _ := services.GetOrder(ctx, orderID)
-		if o != nil && o.ChatID != "" {
-			skip, _ := services.SentOrderStatusNotifyWithin30s(ctx, orderID, newStatus)
-			if !skip {
-				text := services.CustomerMessageForOrderStatus(o, newStatus)
-				if chatID, err := strconv.ParseInt(o.ChatID, 10, 64); err == nil {
-					msg := tgbotapi.NewMessage(chatID, text)
-					if _, sendErr := b.api.Send(msg); sendErr != nil {
-						log.Printf("send customer order status notify: %v", sendErr)
-					} else {
-						_ = services.SaveOutboundMessage(ctx, chatID, text, map[string]interface{}{
-							"channel":  "telegram",
-							"sent_via": "order_status_notify",
-							"order_id": orderID,
-							"status":   newStatus,
-						})
-					}
-				}
-			}
+	o, err := services.GetOrder(ctx, orderID)
+	if err != nil || o == nil || o.Status != services.OrderStatusReady {
+		return
+	}
+	orderLat, orderLon, err := services.GetOrderCoordinates(ctx, orderID)
+	if err != nil || (orderLat == 0 && orderLon == 0) {
+		return
+	}
+	if b.driverBotAPI == nil {
+		return
+	}
+	radiusKm := b.cfg.Delivery.DriverPushRadiusKm
+	if radiusKm <= 0 {
+		radiusKm = 5
+	}
+	drivers, err := services.GetNearbyOnlineDriversForOrder(ctx, orderLat, orderLon, radiusKm, 10)
+	if err != nil {
+		log.Printf("push order to drivers: get nearby drivers failed order_id=%d: %v", orderID, err)
+		return
+	}
+	totalStr := fmt.Sprintf("%d", o.GrandTotal)
+	msgText := "📦 Yangi buyurtma yaqin atrofda!\n\nMasofa: %.2f km\nSumma: %s\n\nQabul qilasizmi?"
+	acceptData := "driver_accept:" + strconv.FormatInt(orderID, 10)
+	for _, d := range drivers {
+		ok, err := services.OrderAvailableForPush(ctx, orderID)
+		if err != nil || !ok {
+			log.Printf("push order to drivers: order_id=%d skipped due to no longer available (status/assigned)", orderID)
+			return
+		}
+		text := fmt.Sprintf(msgText, d.DistanceKm, totalStr)
+		msg := tgbotapi.NewMessage(d.ChatID, text)
+		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Accept Order #"+strconv.FormatInt(orderID, 10), acceptData),
+			),
+		)
+		if _, sendErr := b.driverBotAPI.Send(msg); sendErr != nil {
+			log.Printf("push order to driver: send failed order_id=%d driver_chat_id=%d: %v", orderID, d.ChatID, sendErr)
+		} else {
+			log.Printf("push order to driver: order_id=%d driver_chat_id=%d distance_km=%.2f", orderID, d.ChatID, d.DistanceKm)
 		}
 	}
 }
@@ -1202,83 +1335,21 @@ func (b *Bot) handleDeliveryTypeCallback(cq *tgbotapi.CallbackQuery) {
 		log.Printf("set delivery type failed: order=%d type=%s admin=%d: %v", orderID, deliveryType, adminUserID, err)
 		return
 	}
-
-	var msgText string
 	if deliveryType == "pickup" {
-		msgText = "✅ Buyurtma mijoz o'zi olib ketish uchun belgilandi.\n\nEndi \"Mark Completed\" tugmasini bosing."
-		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "✅ Customer Pickup selected."))
+		b.AnswerCallbackQuery(cq.ID, "✅ Customer Pickup selected.")
 	} else {
-		msgText = "✅ Buyurtma driverga uzatildi, driver qabul qilishi kutilmoqda."
-		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "✅ Sent to Delivery."))
-		// Log order details for debugging driver visibility
+		b.AnswerCallbackQuery(cq.ID, "✅ Sent to Delivery.")
 		o, _ := services.GetOrder(ctx, orderID)
 		if o != nil {
 			var lat, lon float64
-			var hasLocation bool
-			err := db.Pool.QueryRow(ctx, `SELECT lat, lon FROM orders WHERE id = $1`, orderID).Scan(&lat, &lon)
-			if err == nil {
-				hasLocation = lat != 0 && lon != 0
-			}
-			log.Printf("order sent to delivery: order_id=%d status=%s delivery_type=%s has_location=%v lat=%.6f lon=%.6f driver_visible=%v",
-				orderID, o.Status, deliveryType, hasLocation, lat, lon, hasLocation)
+			_ = db.Pool.QueryRow(ctx, `SELECT lat, lon FROM orders WHERE id = $1`, orderID).Scan(&lat, &lon)
+			log.Printf("order sent to delivery: order_id=%d status=%s delivery_type=%s has_location=%v",
+				orderID, o.Status, deliveryType, lat != 0 || lon != 0)
 		}
 	}
-
-	// Get admin's preferred order language
-	adminLang, _ := services.GetAdminOrderLang(ctx, adminUserID)
-	if adminLang == "" {
-		adminLang = lang.Uz
-	}
-
-	// Edit admin message: update keyboard
-	o, _ := services.GetOrder(ctx, orderID)
-	if o == nil {
-		return
-	}
-	deliveryTypePtr := &deliveryType
-	kb := b.orderStatusKeyboard(orderID, o.Status, deliveryTypePtr, adminLang)
-	edit := tgbotapi.NewEditMessageText(cq.Message.Chat.ID, cq.Message.MessageID, cq.Message.Text+"\n\n"+msgText)
-	// Only set ReplyMarkup if keyboard has buttons (Telegram doesn't accept empty keyboards)
-	if len(kb.InlineKeyboard) > 0 {
-		edit.ReplyMarkup = &kb
-		if _, err := b.messageBot.Send(edit); err != nil {
-			log.Printf("edit order message: %v", err)
-		}
-	} else {
-		// Remove keyboard by editing with explicitly empty keyboard array
-		emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
-		editRemoveKb := tgbotapi.NewEditMessageReplyMarkup(cq.Message.Chat.ID, cq.Message.MessageID, emptyKb)
-		if _, err := b.messageBot.Send(editRemoveKb); err != nil {
-			log.Printf("remove keyboard from order message: %v", err)
-		}
-		// Then send text edit without keyboard
-		if _, err := b.messageBot.Send(edit); err != nil {
-			log.Printf("edit order message: %v", err)
-		}
-	}
-
-	// If pickup, notify customer immediately
-	if deliveryType == "pickup" {
-		o, _ := services.GetOrder(ctx, orderID)
-		if o != nil && o.ChatID != "" {
-			skip, _ := services.SentOrderStatusNotifyWithin30s(ctx, orderID, services.OrderStatusReady)
-			if !skip {
-				text := services.CustomerMessageForOrderStatus(o, services.OrderStatusReady)
-				if chatID, err := strconv.ParseInt(o.ChatID, 10, 64); err == nil {
-					msg := tgbotapi.NewMessage(chatID, text)
-					if _, sendErr := b.api.Send(msg); sendErr != nil {
-						log.Printf("send customer order status notify: %v", sendErr)
-					} else {
-						_ = services.SaveOutboundMessage(ctx, chatID, text, map[string]interface{}{
-							"channel":  "telegram",
-							"sent_via": "order_status_notify",
-							"order_id": orderID,
-							"status":   services.OrderStatusReady,
-						})
-					}
-				}
-			}
-		}
+	b.RefreshOrderCards(ctx, orderID)
+	if deliveryType == "delivery" {
+		go b.pushReadyOrderToDrivers(context.Background(), orderID)
 	}
 }
 

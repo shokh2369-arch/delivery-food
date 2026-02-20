@@ -72,6 +72,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, "driver bot:", err)
 			os.Exit(1)
 		}
+		b.SetDriverBotAPI(driverBot.GetAPI())
+		driverBot.SetOnOrderUpdated(func(orderID int64) {
+			go b.RefreshOrderCards(context.Background(), orderID)
+		})
 		go driverBot.Start()
 		fmt.Println("Yetkazib beruvchi bot ishga tushdi.")
 	}

@@ -16,13 +16,14 @@ import (
 
 // DriverBot handles driver interactions (uses DRIVER_BOT_TOKEN).
 type DriverBot struct {
-	api         *tgbotapi.BotAPI
-	mainBot     *tgbotapi.BotAPI // for sending customer notifications
-	messageBot  *tgbotapi.BotAPI // for sending admin notifications
-	config      *config.Config
-	stateMu     sync.RWMutex
-	driverLang  map[int64]string // "uz" or "ru"
-	driverLangMu sync.RWMutex
+	api            *tgbotapi.BotAPI
+	mainBot        *tgbotapi.BotAPI // for sending customer notifications
+	messageBot     *tgbotapi.BotAPI // for sending admin notifications
+	config         *config.Config
+	stateMu        sync.RWMutex
+	driverLang     map[int64]string // "uz" or "ru"
+	driverLangMu   sync.RWMutex
+	onOrderUpdated func(orderID int64) // called after order change so main bot can refresh order cards
 }
 
 // NewDriverBot creates a driver bot using DRIVER_BOT_TOKEN.
@@ -41,6 +42,16 @@ func NewDriverBot(cfg *config.Config, mainBotAPI *tgbotapi.BotAPI, messageBotAPI
 		config:      cfg,
 		driverLang:  make(map[int64]string),
 	}, nil
+}
+
+// GetAPI returns the driver bot API (for customer bot to push orders to drivers).
+func (d *DriverBot) GetAPI() *tgbotapi.BotAPI {
+	return d.api
+}
+
+// SetOnOrderUpdated sets the callback invoked after an order is updated (accept/status/complete) so main bot can refresh order cards.
+func (d *DriverBot) SetOnOrderUpdated(f func(orderID int64)) {
+	d.onOrderUpdated = f
 }
 
 func (d *DriverBot) getLang(userID int64) string {
@@ -494,7 +505,6 @@ func (d *DriverBot) handleAcceptOrder(chatID int64, driver *services.Driver, ord
 		restaurantLoc, err := services.GetLocationByID(ctx, order.LocationID)
 		if err == nil && restaurantLoc != nil {
 			d.send(chatID, fmt.Sprintf(lang.T(l, "dr_restaurant_location"), restaurantLoc.Name))
-			// Send location
 			locationMsg := tgbotapi.NewLocation(chatID, restaurantLoc.Lat, restaurantLoc.Lon)
 			if _, err := d.api.Send(locationMsg); err != nil {
 				log.Printf("send restaurant location to driver: %v", err)
@@ -502,146 +512,8 @@ func (d *DriverBot) handleAcceptOrder(chatID int64, driver *services.Driver, ord
 		}
 	}
 
-	// Show active order card with buttons
-	d.handleActiveOrder(chatID, driver)
-
-	// Notify customer
-	if order.ChatID != "" {
-		if customerChatID, err := strconv.ParseInt(order.ChatID, 10, 64); err == nil {
-			customerMsg := services.CustomerMessageForOrderStatus(order, services.OrderStatusAssigned)
-			msg := tgbotapi.NewMessage(customerChatID, customerMsg)
-			if _, sendErr := d.mainBot.Send(msg); sendErr != nil {
-				log.Printf("send customer driver assign notify: %v", sendErr)
-			} else {
-				_ = services.SaveOutboundMessage(ctx, customerChatID, customerMsg, map[string]interface{}{
-					"channel":  "telegram",
-					"sent_via": "driver_assign",
-					"order_id": orderID,
-				})
-			}
-		}
-	}
-
-	// Notify admin: Driver accepted
-	if d.messageBot != nil {
-		adminIDs, _ := services.GetBranchAdmins(ctx, order.LocationID)
-		if len(adminIDs) > 0 {
-			driverInfo := fmt.Sprintf("✅ Driver accepted")
-			if driver.Phone != "" {
-				driverInfo += fmt.Sprintf("\nPhone: %s", driver.Phone)
-			}
-			if driver.CarPlate != "" {
-				driverInfo += fmt.Sprintf("\nCar: %s", driver.CarPlate)
-			}
-			adminMsg := fmt.Sprintf("%s\n\nOrder #%d", driverInfo, orderID)
-			for _, adminID := range adminIDs {
-				msg := tgbotapi.NewMessage(adminID, adminMsg)
-				if _, err := d.messageBot.Send(msg); err != nil {
-					log.Printf("send admin driver accept notify: %v", err)
-				} else {
-					_ = services.SaveOutboundMessage(ctx, adminID, adminMsg, map[string]interface{}{
-						"channel":  "telegram",
-						"sent_via": "driver_accept_admin",
-						"order_id": orderID,
-					})
-				}
-			}
-		}
-	}
-
-	// Update admin order card with driver details
-	d.updateAdminOrderCard(ctx, orderID, driver)
-}
-
-// updateAdminOrderCard updates the admin order card message with driver details when driver accepts.
-func (d *DriverBot) updateAdminOrderCard(ctx context.Context, orderID int64, driver *services.Driver) {
-	if d.messageBot == nil {
-		return
-	}
-	adminChatID, adminMessageID, err := services.GetAdminMessageIDs(ctx, orderID)
-	if err != nil || adminChatID == nil || adminMessageID == nil {
-		// Fallback: send new message to admin
-		o, _ := services.GetOrder(ctx, orderID)
-		if o == nil {
-			return
-		}
-		adminIDs, _ := services.GetBranchAdmins(ctx, o.LocationID)
-		if len(adminIDs) == 0 {
-			return
-		}
-		driverInfo := fmt.Sprintf("✅ Driver accepted\nDriver ID: %s", driver.ID)
-		if driver.Phone != "" {
-			driverInfo += fmt.Sprintf("\nPhone: %s", driver.Phone)
-		}
-		if driver.CarPlate != "" {
-			driverInfo += fmt.Sprintf("\nCar: %s", driver.CarPlate)
-		}
-		msgText := fmt.Sprintf("Order #%d\n\n%s", orderID, driverInfo)
-		for _, adminID := range adminIDs {
-			msg := tgbotapi.NewMessage(adminID, msgText)
-			d.messageBot.Send(msg)
-		}
-		return
-	}
-	// Get order details
-	o, err := services.GetOrder(ctx, orderID)
-	if err != nil || o == nil {
-		log.Printf("failed to get order %d for admin card update: %v", orderID, err)
-		return
-	}
-	// Get admin's preferred order language
-	adminLang, _ := services.GetAdminOrderLang(ctx, *adminChatID)
-	if adminLang == "" {
-		adminLang = lang.Uz
-	}
-	var statusLabel string
-	switch o.Status {
-	case services.OrderStatusNew:
-		statusLabel = lang.T(adminLang, "adm_status_new")
-	case services.OrderStatusAssigned:
-		statusLabel = lang.T(adminLang, "adm_status_assigned")
-	case services.OrderStatusPickedUp:
-		statusLabel = lang.T(adminLang, "adm_status_picked_up")
-	case services.OrderStatusDelivering:
-		statusLabel = lang.T(adminLang, "adm_status_delivering")
-	case services.OrderStatusCompleted:
-		statusLabel = lang.T(adminLang, "adm_status_completed")
-	default:
-		statusLabel = strings.ToUpper(o.Status)
-	}
-	text := fmt.Sprintf(lang.T(adminLang, "adm_order_id"), orderID) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_total"), o.ItemsTotal) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_status"), statusLabel) + "\n\n" + lang.T(adminLang, "adm_driver_accepted")
-	if driver.Phone != "" {
-		text += fmt.Sprintf("\nPhone: %s", driver.Phone)
-	}
-	if driver.CarPlate != "" {
-		text += fmt.Sprintf("\nCar: %s", driver.CarPlate)
-	}
-	// Build keyboard with contact button if phone exists
-	var rows [][]tgbotapi.InlineKeyboardButton
-	if driver.Phone != "" {
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonURL("📞 Contact Driver", "tel:"+driver.Phone),
-		))
-	}
-	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
-	// Try to edit the message
-	edit := tgbotapi.NewEditMessageText(*adminChatID, *adminMessageID, text)
-	if len(kb.InlineKeyboard) > 0 {
-		edit.ReplyMarkup = &kb
-	} else {
-		// Remove keyboard if empty
-		emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
-		editRemoveKb := tgbotapi.NewEditMessageReplyMarkup(*adminChatID, *adminMessageID, emptyKb)
-		d.messageBot.Send(editRemoveKb)
-	}
-	if _, err := d.messageBot.Send(edit); err != nil {
-		log.Printf("failed to edit admin order card for order %d: %v, falling back to new message", orderID, err)
-		// Fallback: send new message
-		msg := tgbotapi.NewMessage(*adminChatID, text)
-		if len(kb.InlineKeyboard) > 0 {
-			msg.ReplyMarkup = kb
-		}
-		d.messageBot.Send(msg)
+	if d.onOrderUpdated != nil {
+		d.onOrderUpdated(orderID)
 	}
 }
 
@@ -672,117 +544,8 @@ func (d *DriverBot) handleDriverStatusUpdate(chatID int64, driver *services.Driv
 		}
 	}
 
-	// Notify customer
-	if order.ChatID != "" {
-		if customerChatID, err := strconv.ParseInt(order.ChatID, 10, 64); err == nil {
-			customerMsg := services.CustomerMessageForOrderStatus(order, newStatus)
-			msg := tgbotapi.NewMessage(customerChatID, customerMsg)
-			if _, sendErr := d.mainBot.Send(msg); sendErr != nil {
-				log.Printf("send customer status notify: %v", sendErr)
-			} else {
-				_ = services.SaveOutboundMessage(ctx, customerChatID, customerMsg, map[string]interface{}{
-					"channel":  "telegram",
-					"sent_via": "driver_status_update",
-					"order_id": orderID,
-					"status":   newStatus,
-				})
-			}
-		}
-	}
-
-	// Notify admin
-	if d.messageBot != nil {
-		adminIDs, _ := services.GetBranchAdmins(ctx, order.LocationID)
-		var adminMsg string
-		switch newStatus {
-		case services.OrderStatusPickedUp:
-			adminMsg = fmt.Sprintf("📦 Order #%d driver tomonidan OLINDI (collected).", orderID)
-		case services.OrderStatusDelivering:
-			adminMsg = fmt.Sprintf("🛵 Order #%d yetkazilmoqda.", orderID)
-		}
-		if adminMsg != "" {
-			for _, adminID := range adminIDs {
-				msg := tgbotapi.NewMessage(adminID, adminMsg)
-				if _, err := d.messageBot.Send(msg); err != nil {
-					log.Printf("send admin status notify: %v", err)
-				} else {
-					_ = services.SaveOutboundMessage(ctx, adminID, adminMsg, map[string]interface{}{
-						"channel":  "telegram",
-						"sent_via": "driver_status_update_admin",
-						"order_id": orderID,
-						"status":   newStatus,
-					})
-				}
-			}
-		}
-		// Update admin order card if message ID exists
-		adminChatID, adminMessageID, _ := services.GetAdminMessageIDs(ctx, orderID)
-		if adminChatID != nil && adminMessageID != nil {
-			o, _ := services.GetOrder(ctx, orderID)
-			if o != nil {
-				adminLang, _ := services.GetAdminOrderLang(ctx, *adminChatID)
-				if adminLang == "" {
-					adminLang = lang.Uz
-				}
-				var statusLabel string
-				switch newStatus {
-				case services.OrderStatusPickedUp:
-					statusLabel = lang.T(adminLang, "adm_status_picked_up")
-				case services.OrderStatusDelivering:
-					statusLabel = lang.T(adminLang, "adm_status_delivering")
-				case services.OrderStatusCompleted:
-					statusLabel = lang.T(adminLang, "adm_status_completed")
-				default:
-					statusLabel = strings.ToUpper(newStatus)
-				}
-				text := fmt.Sprintf(lang.T(adminLang, "adm_order_id"), orderID) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_total"), o.ItemsTotal) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_status"), statusLabel)
-				edit := tgbotapi.NewEditMessageText(*adminChatID, *adminMessageID, text)
-				d.messageBot.Send(edit)
-			}
-		}
-	}
-
-	order, _ = services.GetOrder(ctx, orderID)
-	if order != nil && messageID > 0 {
-		l := d.getLang(driver.TgUserID)
-		if l == "" {
-			l = lang.Uz
-		}
-		var rows [][]tgbotapi.InlineKeyboardButton
-		var statusText string
-		switch order.Status {
-		case services.OrderStatusAssigned:
-			statusText = lang.T(l, "dr_status_accepted")
-			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_mark_collected"), fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusPickedUp)),
-			))
-		case services.OrderStatusPickedUp:
-			statusText = lang.T(l, "dr_status_picked")
-			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_start_delivering"), fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusDelivering)),
-			))
-		case services.OrderStatusDelivering:
-			statusText = lang.T(l, "dr_status_delivering")
-			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_order_completed_btn"), fmt.Sprintf("driver_status:%d:%s", order.ID, services.OrderStatusCompleted)),
-			))
-		case services.OrderStatusCompleted:
-			statusText = lang.T(l, "dr_status_completed")
-		}
-		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "dr_back"), "driver:back"),
-		))
-		text := fmt.Sprintf(lang.T(l, "dr_active_header"), order.ID, order.ItemsTotal, order.DeliveryFee, order.GrandTotal, statusText)
-		kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
-		edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
-		if len(kb.InlineKeyboard) > 0 {
-			edit.ReplyMarkup = &kb
-		} else {
-			emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
-			editRemoveKb := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, emptyKb)
-			d.api.Send(editRemoveKb)
-		}
-		d.api.Send(edit)
+	if d.onOrderUpdated != nil {
+		d.onOrderUpdated(orderID)
 	}
 }
 
@@ -799,70 +562,10 @@ func (d *DriverBot) handleCompleteDelivery(chatID int64, driver *services.Driver
 		return
 	}
 
-	l := d.getLang(driver.TgUserID)
-	if l == "" {
-		l = lang.Uz
-	}
-	if messageID > 0 {
-		text := fmt.Sprintf(lang.T(l, "dr_active_header_done"), order.ID, order.ItemsTotal, order.DeliveryFee, order.GrandTotal)
-		emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
-		editRemoveKb := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, emptyKb)
-		d.api.Send(editRemoveKb)
-		edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
-		d.api.Send(edit)
-	}
-
 	d.sendLang(chatID, driver.TgUserID, "dr_delivery_completed", orderID)
 	d.sendDriverPanel(chatID, driver)
 
-	// Notify customer
-	if order.ChatID != "" {
-		if customerChatID, err := strconv.ParseInt(order.ChatID, 10, 64); err == nil {
-			customerMsg := services.CustomerMessageForOrderStatus(order, services.OrderStatusCompleted)
-			msg := tgbotapi.NewMessage(customerChatID, customerMsg)
-			if _, sendErr := d.mainBot.Send(msg); sendErr != nil {
-				log.Printf("send customer delivery complete: %v", sendErr)
-			} else {
-				_ = services.SaveOutboundMessage(ctx, customerChatID, customerMsg, map[string]interface{}{
-					"channel":  "telegram",
-					"sent_via": "driver_delivery_complete",
-					"order_id": orderID,
-				})
-			}
-		}
-	}
-
-	// Notify admin
-	if d.messageBot != nil {
-		adminIDs, _ := services.GetBranchAdmins(ctx, order.LocationID)
-		if len(adminIDs) > 0 {
-			adminMsg := fmt.Sprintf("✅ Order #%d yetkazildi va yakunlandi.", orderID)
-			for _, adminID := range adminIDs {
-				msg := tgbotapi.NewMessage(adminID, adminMsg)
-				if _, err := d.messageBot.Send(msg); err != nil {
-					log.Printf("send admin delivery complete notify: %v", err)
-				} else {
-					_ = services.SaveOutboundMessage(ctx, adminID, adminMsg, map[string]interface{}{
-						"channel":  "telegram",
-						"sent_via": "driver_delivery_complete_admin",
-						"order_id": orderID,
-					})
-				}
-			}
-		}
-		// Update admin order card if message ID exists
-		adminChatID, adminMessageID, _ := services.GetAdminMessageIDs(ctx, orderID)
-		if adminChatID != nil && adminMessageID != nil {
-			adminLang, _ := services.GetAdminOrderLang(ctx, *adminChatID)
-			if adminLang == "" {
-				adminLang = lang.Uz
-			}
-			text := fmt.Sprintf(lang.T(adminLang, "adm_order_id"), orderID) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_total"), order.ItemsTotal) + "\n\n" + fmt.Sprintf(lang.T(adminLang, "adm_status"), lang.T(adminLang, "adm_status_completed"))
-			edit := tgbotapi.NewEditMessageText(*adminChatID, *adminMessageID, text)
-			emptyKb := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
-			editRemoveKb := tgbotapi.NewEditMessageReplyMarkup(*adminChatID, *adminMessageID, emptyKb)
-			d.messageBot.Send(editRemoveKb)
-			d.messageBot.Send(edit)
-		}
+	if d.onOrderUpdated != nil {
+		d.onOrderUpdated(orderID)
 	}
 }

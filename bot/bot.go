@@ -319,7 +319,21 @@ func (b *Bot) RefreshOrderCards(ctx context.Context, orderID int64) {
 	}
 }
 
+func (b *Bot) setBotCommands() error {
+	cfg := tgbotapi.SetMyCommandsConfig{
+		Commands: []tgbotapi.BotCommand{
+			{Command: "start", Description: "Bosh sahifa"},
+			{Command: "language", Description: "Tilni o'zgartirish"},
+			{Command: "orders", Description: "Buyurtmalarim"},
+		},
+	}
+	_, err := b.api.Request(cfg)
+	return err
+}
+
 func (b *Bot) Start() {
+	// Register bot command menu (Telegram client shows these in the input menu)
+	_ = b.setBotCommands()
 	if b.messageBot != nil {
 		go b.startOrderStatusCallbacks()
 	}
@@ -348,6 +362,10 @@ func (b *Bot) Start() {
 		switch {
 		case text == "/start":
 			b.handleStart(msg.Chat.ID, userID)
+		case text == "/language":
+			b.handleLanguage(msg.Chat.ID, userID)
+		case text == "/orders":
+			b.handleOrders(msg.Chat.ID, userID)
 		case text == "/menu":
 			b.userSharedCoordsMu.RLock()
 			_, hasLocation := b.userSharedCoords[userID]
@@ -387,13 +405,20 @@ func (b *Bot) send(chatID int64, text string) {
 
 func (b *Bot) getLang(userID int64) string {
 	b.userLangMu.RLock()
-	defer b.userLangMu.RUnlock()
 	l := b.userLang[userID]
-	// Return "" if user has not chosen a language yet (so /start shows language selection)
-	if l == "" || (l != lang.Uz && l != lang.Ru) {
-		return ""
+	b.userLangMu.RUnlock()
+	if l == lang.Uz || l == lang.Ru {
+		return l
 	}
-	return l
+	// Load from DB (persisted language)
+	ctx := context.Background()
+	if stored, ok := services.GetCustomerLanguage(ctx, userID); ok && (stored == lang.Uz || stored == lang.Ru) {
+		b.userLangMu.Lock()
+		b.userLang[userID] = stored
+		b.userLangMu.Unlock()
+		return stored
+	}
+	return ""
 }
 
 func (b *Bot) setLang(userID int64, langCode string) {
@@ -419,18 +444,92 @@ func (b *Bot) sendWithInline(chatID int64, text string, kb tgbotapi.InlineKeyboa
 }
 
 func (b *Bot) handleStart(chatID int64, userID int64) {
-	// Always show language selection on /start
-	kb := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("O'zbek", "lang:uz"),
-			tgbotapi.NewInlineKeyboardButtonData("Русский", "lang:ru"),
+	ctx := context.Background()
+	storedLang, hasLang := services.GetCustomerLanguage(ctx, userID)
+	if !hasLang {
+		// First time: ask language only once
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("O'zbek", "lang:uz"),
+				tgbotapi.NewInlineKeyboardButtonData("Русский", "lang:ru"),
+			),
+		)
+		msg := tgbotapi.NewMessage(chatID, lang.T(lang.Uz, "choose_lang_both"))
+		msg.ReplyMarkup = kb
+		if _, err := b.api.Send(msg); err != nil {
+			log.Printf("send error: %v", err)
+		}
+		return
+	}
+	// Language already set: request location (do not ask language again)
+	b.setLang(userID, storedLang)
+	b.requestLocationOnly(chatID, userID)
+}
+
+// requestLocationOnly sends the location keyboard and "Lokatsiyangizni yuboring" (no welcome text). Used on /start when language already known.
+func (b *Bot) requestLocationOnly(chatID int64, userID int64) {
+	l := b.getLang(userID)
+	if l == "" {
+		l = lang.Uz
+	}
+	kb := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButtonLocation(lang.T(l, "share_location")),
 		),
 	)
-	msg := tgbotapi.NewMessage(chatID, lang.T(lang.Uz, "choose_lang_both"))
+	kb.OneTimeKeyboard = true
+	kb.ResizeKeyboard = true
+	msg := tgbotapi.NewMessage(chatID, lang.T(l, "request_location_only"))
 	msg.ReplyMarkup = kb
 	if _, err := b.api.Send(msg); err != nil {
 		log.Printf("send error: %v", err)
 	}
+}
+
+func (b *Bot) handleLanguage(chatID int64, userID int64) {
+	l := b.getLang(userID)
+	if l == "" {
+		l = lang.Uz
+	}
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("O'zbek", "lang_change:uz"),
+			tgbotapi.NewInlineKeyboardButtonData("Русский", "lang_change:ru"),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, lang.T(l, "choose_lang_both"))
+	msg.ReplyMarkup = kb
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("send error: %v", err)
+	}
+}
+
+func (b *Bot) handleOrders(chatID int64, userID int64) {
+	ctx := context.Background()
+	l := b.getLang(userID)
+	if l == "" {
+		l = lang.Uz
+	}
+	orders, err := services.ListOrdersByUserID(ctx, userID, 20)
+	if err != nil {
+		b.send(chatID, "Error: "+err.Error())
+		return
+	}
+	if len(orders) == 0 {
+		b.send(chatID, lang.T(l, "my_orders_empty"))
+		return
+	}
+	text := lang.T(l, "my_orders_header")
+	datePart := func(s string) string {
+		if len(s) >= 10 {
+			return s[:10]
+		}
+		return s
+	}
+	for _, o := range orders {
+		text += fmt.Sprintf("#%d — %s — %d so'm — %s\n", o.ID, o.Status, o.GrandTotal, datePart(o.CreatedAt))
+	}
+	b.send(chatID, text)
 }
 
 // showWelcomeWithLocation shows welcome message and location keyboard in the given language (after user chose lang).
@@ -466,14 +565,18 @@ func (b *Bot) categoryKeyboard(langCode string) tgbotapi.InlineKeyboardMarkup {
 func (b *Bot) menuKeyboard(userID int64, category string, langCode string) tgbotapi.InlineKeyboardMarkup {
 	ctx := context.Background()
 	var items []models.MenuItem
-	// Try to load user's selected location; if not found, fall back to global menu
+	// Try to load user's selected location; if not found or subscription expired, fall back to global menu
 	if loc, err := services.GetUserLocation(ctx, userID); err == nil && loc != nil {
-		items, err = services.ListMenuByCategoryAndLocation(ctx, category, loc.ID)
-		if err != nil {
-			log.Printf("list menu by location: %v", err)
-			items = nil
+		active, _ := services.LocationHasActiveSubscription(ctx, loc.ID)
+		if active {
+			items, err = services.ListMenuByCategoryAndLocation(ctx, category, loc.ID)
+			if err != nil {
+				log.Printf("list menu by location: %v", err)
+				items = nil
+			}
 		}
-	} else {
+	}
+	if items == nil {
 		var err error
 		items, err = services.ListMenuByCategory(ctx, category)
 		if err != nil {
@@ -576,8 +679,25 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 
 	switch {
 	case data == "lang:uz" || data == "lang:ru":
+		// First-time language selection (from /start): persist then request location
 		langCode := strings.TrimPrefix(data, "lang:")
+		if langCode != lang.Uz && langCode != lang.Ru {
+			break
+		}
+		ctx := context.Background()
+		_ = services.SetCustomerLanguage(ctx, userID, langCode)
+		b.setLang(userID, langCode)
 		b.showWelcomeWithLocation(chatID, userID, langCode)
+	case data == "lang_change:uz" || data == "lang_change:ru":
+		// Manual language change (from /language): persist and confirm
+		langCode := strings.TrimPrefix(data, "lang_change:")
+		if langCode != lang.Uz && langCode != lang.Ru {
+			break
+		}
+		ctx := context.Background()
+		_ = services.SetCustomerLanguage(ctx, userID, langCode)
+		b.setLang(userID, langCode)
+		b.send(chatID, lang.T(langCode, "language_changed"))
 	case data == "menu":
 		// Check if user has shared location before showing menu
 		b.userSharedCoordsMu.RLock()
@@ -667,6 +787,8 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 		b.requestPhone(chatID, userID)
 	case data == "confirm_reject":
 		b.sendMenu(chatID, userID)
+	case strings.HasPrefix(data, "checkout_delivery:"):
+		b.handleCheckoutDeliveryCallback(cq)
 	case strings.HasPrefix(data, "suggest:"):
 		// Check location before showing suggestions
 		b.userSharedCoordsMu.RLock()
@@ -755,14 +877,14 @@ func (b *Bot) sendSuggestionScreen(chatID int64, userID int64) {
 		return
 	}
 
-	// Compute delivery fee: distance from branch to user, then apply rule (< 500 -> 0, >= 500 -> 1000)
+	// Delivery fee: distance from restaurant (branch) to customer (shared location). Require valid coords for both.
 	var deliveryFee int64
-	userLocation, _ := services.GetUserLocation(ctx, userID)
-	b.userSharedCoordsMu.RLock()
-	coords, hasCoords := b.userSharedCoords[userID]
-	b.userSharedCoordsMu.RUnlock()
-	if userLocation != nil && hasCoords {
-		distanceKm := services.HaversineDistanceKm(userLocation.Lat, userLocation.Lon, coords.Lat, coords.Lon)
+	branch, _ := services.GetUserLocation(ctx, userID)
+	customerLat, customerLon, hasCustomer := b.getCustomerCoords(ctx, userID)
+	hasValidBranch := branch != nil && (branch.Lat != 0 || branch.Lon != 0)
+	hasValidCustomer := hasCustomer && (customerLat != 0 || customerLon != 0)
+	if hasValidBranch && hasValidCustomer {
+		distanceKm := services.HaversineDistanceKm(branch.Lat, branch.Lon, customerLat, customerLon)
 		baseFee := b.cfg.Delivery.BaseFee
 		if baseFee < 0 {
 			baseFee = 5000
@@ -861,7 +983,7 @@ func (b *Bot) requestPhone(chatID int64, userID int64) {
 func (b *Bot) handleUserLocation(chatID int64, userID int64, lat, lon float64) {
 	l := b.getLang(userID)
 	ctx := context.Background()
-	locs, err := services.ListLocations(ctx)
+	locs, err := services.ListLocationsForCustomer(ctx)
 	if err != nil {
 		b.removeKeyboard(chatID, lang.T(l, "locations_err"))
 		return
@@ -877,10 +999,13 @@ func (b *Bot) handleUserLocation(chatID int64, userID int64, lat, lon float64) {
 	b.locSuggestions[userID] = withDist
 	b.locSuggestionsMu.Unlock()
 
-	// Store user's shared coordinates
+	// Store user's shared coordinates (memory + DB so fee calculation works at checkout)
 	b.userSharedCoordsMu.Lock()
 	b.userSharedCoords[userID] = struct{ Lat, Lon float64 }{Lat: lat, Lon: lon}
 	b.userSharedCoordsMu.Unlock()
+	if err := services.SetUserDeliveryCoords(ctx, userID, lat, lon); err != nil {
+		log.Printf("SetUserDeliveryCoords: %v", err)
+	}
 
 	b.sendLocationSuggestions(chatID, userID, 0, false)
 }
@@ -957,7 +1082,7 @@ func (b *Bot) sendLocationSuggestionsManual(chatID int64, userID int64, page int
 	const pageSize = 5
 
 	ctx := context.Background()
-	locs, err := services.ListLocations(ctx)
+	locs, err := services.ListLocationsForCustomer(ctx)
 	if err != nil {
 		b.removeKeyboard(chatID, "Joylashuvlar ro'yxatini yuklashda xatolik yuz berdi.")
 		return
@@ -1016,11 +1141,20 @@ func (b *Bot) sendLocationSuggestionsManual(chatID int64, userID int64, page int
 	}
 }
 
+// getCustomerCoords returns the customer's delivery coordinates (from memory or DB). Used for distance-based delivery fee.
+func (b *Bot) getCustomerCoords(ctx context.Context, userID int64) (lat, lon float64, ok bool) {
+	b.userSharedCoordsMu.RLock()
+	if c, has := b.userSharedCoords[userID]; has {
+		b.userSharedCoordsMu.RUnlock()
+		return c.Lat, c.Lon, true
+	}
+	b.userSharedCoordsMu.RUnlock()
+	return services.GetUserDeliveryCoords(ctx, userID)
+}
+
 func (b *Bot) handleContact(chatID int64, userID int64, phone string, customerUsername string) {
 	// Verify user has shared location before allowing order creation
-	b.userSharedCoordsMu.RLock()
-	_, hasLocation := b.userSharedCoords[userID]
-	b.userSharedCoordsMu.RUnlock()
+	_, _, hasLocation := b.getCustomerCoords(context.Background(), userID)
 	if !hasLocation {
 		b.sendLang(chatID, userID, "please_share_loc")
 		b.showWelcomeWithLocation(chatID, userID, b.getLang(userID))
@@ -1033,36 +1167,79 @@ func (b *Bot) handleContact(chatID int64, userID int64, phone string, customerUs
 		b.removeKeyboard(chatID, lang.T(l, "please_add_order"))
 		return
 	}
-	itemsTotal := checkout.ItemsTotal
-	// Save items for admin notification before deleting checkout
-	items := make([]cartItem, len(checkout.CartItems))
-	for i, sci := range checkout.CartItems {
-		items[i] = serviceToCartItem(sci)
+	checkout.Phone = phone
+	if err := services.SaveCheckout(ctx, userID, checkout); err != nil {
+		b.removeKeyboard(chatID, lang.T(l, "please_add_order"))
+		return
 	}
+	b.removeKeyboard(chatID, "✅")
+
+	// Branch = restaurant they ordered from; customer = shared delivery address. Fee = distance(branch → customer).
+	branch, _ := services.GetUserLocation(ctx, userID)
+	customerLat, customerLon, _ := b.getCustomerCoords(ctx, userID)
+
+	baseFee := b.cfg.Delivery.BaseFee
+	if baseFee < 0 {
+		baseFee = 5000
+	}
+	ratePerKm := b.cfg.Delivery.RatePerKm
+	if ratePerKm <= 0 {
+		ratePerKm = 4000
+	}
+	var deliveryFee int64
+	hasValidBranch := branch != nil && (branch.Lat != 0 || branch.Lon != 0)
+	hasValidCustomer := customerLat != 0 || customerLon != 0
+	if hasValidBranch && hasValidCustomer {
+		distanceKm := services.HaversineDistanceKm(branch.Lat, branch.Lon, customerLat, customerLon)
+		rawFee := services.CalcDeliveryFee(distanceKm, baseFee, ratePerKm)
+		deliveryFee = services.ApplyDeliveryFeeRule(rawFee)
+	}
+	text := lang.T(l, "how_receive")
+	if deliveryFee > 0 {
+		text += fmt.Sprintf("\n\n🚚 Yetkazib berish: %d so'm", deliveryFee)
+	}
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "delivery_option", deliveryFee), "checkout_delivery:delivery"),
+			tgbotapi.NewInlineKeyboardButtonData(lang.T(l, "pickup_option"), "checkout_delivery:pickup"),
+		),
+	)
+	b.sendWithInline(chatID, text, kb)
+}
+
+func (b *Bot) handleCheckoutDeliveryCallback(cq *tgbotapi.CallbackQuery) {
+	chatID := cq.Message.Chat.ID
+	userID := cq.From.ID
+	parts := strings.SplitN(cq.Data, ":", 2)
+	if len(parts) != 2 {
+		b.api.Request(tgbotapi.NewCallback(cq.ID, ""))
+		return
+	}
+	deliveryType := parts[1]
+	if deliveryType != "delivery" && deliveryType != "pickup" {
+		b.api.Request(tgbotapi.NewCallback(cq.ID, ""))
+		return
+	}
+	b.api.Request(tgbotapi.NewCallback(cq.ID, "✅"))
+
+	ctx := context.Background()
+	checkout, err := services.GetCheckout(ctx, userID)
+	if err != nil || checkout == nil || len(checkout.CartItems) == 0 {
+		b.send(chatID, lang.T(b.getLang(userID), "please_add_order"))
+		return
+	}
+	itemsTotal := checkout.ItemsTotal
+	phone := checkout.Phone
 	services.DeleteCheckout(ctx, userID)
 
-	// Get user's selected location for order and notification
-	var userLocation *models.Location
-	if loc, err := services.GetUserLocation(ctx, userID); err == nil && loc != nil {
-		userLocation = loc
-	}
-
-	// Get user's shared coordinates
-	var userLat, userLon float64
-	var hasUserLocation bool
-	b.userSharedCoordsMu.RLock()
-	if coords, ok := b.userSharedCoords[userID]; ok {
-		userLat = coords.Lat
-		userLon = coords.Lon
-		hasUserLocation = true
-	}
-	b.userSharedCoordsMu.RUnlock()
+	// Branch = restaurant; customer = shared delivery address. Distance = branch → customer (from memory or DB).
+	branch, _ := services.GetUserLocation(ctx, userID)
+	customerLat, customerLon, hasCustomer := b.getCustomerCoords(ctx, userID)
 
 	locationID := int64(0)
-	if userLocation != nil {
-		locationID = userLocation.ID
+	if branch != nil {
+		locationID = branch.ID
 	}
-	// Taxi-style delivery fee: 5000 start + 4000 per km
 	baseFee := b.cfg.Delivery.BaseFee
 	if baseFee < 0 {
 		baseFee = 5000
@@ -1073,37 +1250,45 @@ func (b *Bot) handleContact(chatID int64, userID int64, phone string, customerUs
 	}
 	var distanceKm float64
 	var deliveryFee int64
-	if hasUserLocation && userLocation != nil {
-		distanceKm = services.HaversineDistanceKm(userLocation.Lat, userLocation.Lon, userLat, userLon)
+	hasValidBranch := branch != nil && (branch.Lat != 0 || branch.Lon != 0)
+	hasValidCustomer := hasCustomer && (customerLat != 0 || customerLon != 0)
+	if hasValidBranch && hasValidCustomer && deliveryType == "delivery" {
+		distanceKm = services.HaversineDistanceKm(branch.Lat, branch.Lon, customerLat, customerLon)
 		rawFee := services.CalcDeliveryFee(distanceKm, baseFee, ratePerKm)
 		deliveryFee = services.ApplyDeliveryFeeRule(rawFee)
 	}
+	if deliveryType == "pickup" {
+		deliveryFee = 0
+	}
+
 	id, err := services.CreateOrder(ctx, models.CreateOrderInput{
-		UserID:      userID,
-		ChatID:      strconv.FormatInt(chatID, 10),
-		Phone:       phone,
-		Lat:         userLat,
-		Lon:         userLon,
-		DistanceKm:  distanceKm,
-		DeliveryFee: deliveryFee,
-		ItemsTotal:  itemsTotal,
-		LocationID:  locationID,
+		UserID:       userID,
+		ChatID:       strconv.FormatInt(chatID, 10),
+		Phone:        phone,
+		Lat:          customerLat,
+		Lon:          customerLon,
+		DistanceKm:   distanceKm,
+		DeliveryFee:  deliveryFee,
+		ItemsTotal:   itemsTotal,
+		LocationID:   locationID,
+		DeliveryType: deliveryType,
 	})
 	if err != nil {
 		b.sendLang(chatID, userID, "order_failed", err.Error())
 		return
 	}
 
+	l := b.getLang(userID)
 	confirmMsg := lang.T(l, "order_confirmed", id, phone, itemsTotal)
 	confirmMsg += lang.T(l, "order_total", itemsTotal+deliveryFee)
-	b.removeKeyboard(chatID, confirmMsg)
+	b.send(chatID, confirmMsg)
 
 	o, _ := services.GetOrder(ctx, id)
 	if o != nil {
 		b.UpsertOrderCard(ctx, "customer", id, chatID, services.BuildCustomerCard(o, nil, ""))
 	}
-	// One evolving admin card (first branch admin)
-	b.notifyAdmin(ctx, id, userLocation, userLat, userLon, hasUserLocation)
+	hasUserLocation := customerLat != 0 || customerLon != 0
+	b.notifyAdmin(ctx, id, branch, customerLat, customerLon, hasUserLocation)
 }
 
 func (b *Bot) notifyAdmin(ctx context.Context, orderID int64, location *models.Location, userLat, userLon float64, hasUserLocation bool) {
@@ -1204,8 +1389,6 @@ func (b *Bot) startOrderStatusCallbacks() {
 		data := cq.Data
 		if strings.HasPrefix(data, "order_status:") {
 			b.handleOrderStatusCallback(cq)
-		} else if strings.HasPrefix(data, "delivery_type:") {
-			b.handleDeliveryTypeCallback(cq)
 		}
 	}
 }
@@ -1239,6 +1422,12 @@ func (b *Bot) handleOrderStatusCallback(cq *tgbotapi.CallbackQuery) {
 	}
 	b.AnswerCallbackQuery(cq.ID, "✅ Status updated.")
 	b.RefreshOrderCards(ctx, orderID)
+	if newStatus == services.OrderStatusReady {
+		o, _ := services.GetOrder(ctx, orderID)
+		if o != nil && o.DeliveryType != nil && *o.DeliveryType == "delivery" {
+			go b.pushReadyOrderToDrivers(context.Background(), orderID)
+		}
+	}
 }
 
 // pushReadyOrderToDrivers finds nearby online drivers and sends them a Telegram message with an Accept button.
@@ -1280,16 +1469,16 @@ func (b *Bot) pushReadyOrderToDrivers(ctx context.Context, orderID int64) {
 		log.Printf("push order to drivers: get nearby drivers failed order_id=%d: %v", orderID, err)
 		return
 	}
-	totalStr := fmt.Sprintf("%d", o.GrandTotal)
-	msgText := "📦 Yangi buyurtma yaqin atrofda!\n\nMasofa: %.2f km\nSumma: %s\n\nQabul qilasizmi?"
 	acceptData := "driver_accept:" + strconv.FormatInt(orderID, 10)
+	// Include items total, delivery fee, and grand total so driver sees full price
+	msgText := "📦 Yangi buyurtma yaqin atrofda!\n\nMasofa: %.2f km\nBuyurtma: %d so'm\nYetkazib berish: %d so'm\nJami: %d so'm\n\nQabul qilasizmi?"
 	for _, d := range drivers {
 		ok, err := services.OrderAvailableForPush(ctx, orderID)
 		if err != nil || !ok {
 			log.Printf("push order to drivers: order_id=%d skipped due to no longer available (status/assigned)", orderID)
 			return
 		}
-		text := fmt.Sprintf(msgText, d.DistanceKm, totalStr)
+		text := fmt.Sprintf(msgText, d.DistanceKm, o.ItemsTotal, o.DeliveryFee, o.GrandTotal)
 		msg := tgbotapi.NewMessage(d.ChatID, text)
 		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
@@ -1301,55 +1490,6 @@ func (b *Bot) pushReadyOrderToDrivers(ctx context.Context, orderID int64) {
 		} else {
 			log.Printf("push order to driver: order_id=%d driver_chat_id=%d distance_km=%.2f", orderID, d.ChatID, d.DistanceKm)
 		}
-	}
-}
-
-func (b *Bot) handleDeliveryTypeCallback(cq *tgbotapi.CallbackQuery) {
-	parts := strings.SplitN(cq.Data, ":", 3)
-	if len(parts) != 3 {
-		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "Invalid callback."))
-		return
-	}
-	orderID, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil || orderID <= 0 {
-		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "Invalid order."))
-		return
-	}
-	deliveryType := parts[2]
-	if deliveryType != "pickup" && deliveryType != "delivery" {
-		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "Invalid delivery type."))
-		return
-	}
-	adminUserID := cq.From.ID
-
-	ctx := context.Background()
-	adminLocID, err := services.GetAdminLocationID(ctx, adminUserID)
-	if err != nil || adminLocID == 0 {
-		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, "Unauthorized."))
-		return
-	}
-
-	err = services.SetDeliveryType(ctx, orderID, deliveryType, adminLocID)
-	if err != nil {
-		b.messageBot.Request(tgbotapi.NewCallback(cq.ID, err.Error()))
-		log.Printf("set delivery type failed: order=%d type=%s admin=%d: %v", orderID, deliveryType, adminUserID, err)
-		return
-	}
-	if deliveryType == "pickup" {
-		b.AnswerCallbackQuery(cq.ID, "✅ Customer Pickup selected.")
-	} else {
-		b.AnswerCallbackQuery(cq.ID, "✅ Sent to Delivery.")
-		o, _ := services.GetOrder(ctx, orderID)
-		if o != nil {
-			var lat, lon float64
-			_ = db.Pool.QueryRow(ctx, `SELECT lat, lon FROM orders WHERE id = $1`, orderID).Scan(&lat, &lon)
-			log.Printf("order sent to delivery: order_id=%d status=%s delivery_type=%s has_location=%v",
-				orderID, o.Status, deliveryType, lat != 0 || lon != 0)
-		}
-	}
-	b.RefreshOrderCards(ctx, orderID)
-	if deliveryType == "delivery" {
-		go b.pushReadyOrderToDrivers(context.Background(), orderID)
 	}
 }
 

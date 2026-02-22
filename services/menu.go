@@ -40,13 +40,12 @@ func ListMenuByCategory(ctx context.Context, category string) ([]models.MenuItem
 }
 
 // ListMenuByCategoryAndLocation lists menu items for a given category and location.
-// Items with a matching location_id are returned; if there are "global" items
-// without a location_id, they are also included.
+// Only items that belong to this location (location_id = locationID) are returned.
+// New locations have no items until the admin adds them.
 func ListMenuByCategoryAndLocation(ctx context.Context, category string, locationID int64) ([]models.MenuItem, error) {
 	rows, err := db.Pool.Query(ctx, `
 		SELECT id, category, name, price FROM menu_items
-		WHERE category = $1
-		  AND (location_id = $2 OR location_id IS NULL)
+		WHERE category = $1 AND location_id = $2
 		ORDER BY id`,
 		category, locationID,
 	)

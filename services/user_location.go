@@ -45,3 +45,26 @@ func GetUserLocation(ctx context.Context, userID int64) (*models.Location, error
 	return &l, nil
 }
 
+// SetUserDeliveryCoords stores the user's shared delivery coordinates (when they share location).
+func SetUserDeliveryCoords(ctx context.Context, userID int64, lat, lon float64) error {
+	_, err := db.Pool.Exec(ctx, `
+		INSERT INTO user_delivery_coords (user_id, lat, lon, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (user_id) DO UPDATE SET
+			lat = EXCLUDED.lat,
+			lon = EXCLUDED.lon,
+			updated_at = now()`,
+		userID, lat, lon,
+	)
+	return err
+}
+
+// GetUserDeliveryCoords returns the user's last shared delivery coordinates, or (0,0,false) if none.
+func GetUserDeliveryCoords(ctx context.Context, userID int64) (lat, lon float64, ok bool) {
+	err := db.Pool.QueryRow(ctx, `SELECT lat, lon FROM user_delivery_coords WHERE user_id = $1`, userID).Scan(&lat, &lon)
+	if err != nil {
+		return 0, 0, false
+	}
+	return lat, lon, true
+}
+

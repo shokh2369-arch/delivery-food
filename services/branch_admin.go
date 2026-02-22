@@ -75,19 +75,19 @@ func IsBranchAdminPasswordUnique(ctx context.Context, passwordHash string, exclu
 	return count == 0, nil
 }
 
-// AuthenticateBranchAdmin checks userID + plainPassword; returns the branch location ID if valid.
+// AuthenticateBranchAdmin checks plainPassword against any branch's password; on match records this tg_user_id as having access and logs the login. Multiple users can log in with the same restaurant password.
 func AuthenticateBranchAdmin(ctx context.Context, userID int64, plainPassword string) (branchLocationID int64, ok bool, err error) {
 	if err := EnsureBranchAdminsTable(ctx); err != nil {
 		return 0, false, err
 	}
 	rows, err := db.Pool.Query(ctx, `
-		SELECT branch_location_id, password_hash FROM branch_admins WHERE admin_user_id = $1 AND password_hash IS NOT NULL`,
-		userID,
+		SELECT branch_location_id, password_hash FROM branch_admins WHERE password_hash IS NOT NULL`,
 	)
 	if err != nil {
 		return 0, false, fmt.Errorf("query branch admins: %w", err)
 	}
 	defer rows.Close()
+	var matchedLocID int64
 	for rows.Next() {
 		var locID int64
 		var hash string
@@ -95,10 +95,24 @@ func AuthenticateBranchAdmin(ctx context.Context, userID int64, plainPassword st
 			return 0, false, err
 		}
 		if bcrypt.CompareHashAndPassword([]byte(hash), []byte(plainPassword)) == nil {
-			return locID, true, nil
+			matchedLocID = locID
+			break
 		}
 	}
-	return 0, false, rows.Err()
+	if matchedLocID == 0 {
+		return 0, false, rows.Err()
+	}
+	// Record session and audit
+	_, _ = db.Pool.Exec(ctx, `
+		INSERT INTO branch_admin_access (tg_user_id, branch_location_id, logged_in_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (tg_user_id) DO UPDATE SET branch_location_id = $2, logged_in_at = now()`,
+		userID, matchedLocID,
+	)
+	_, _ = db.Pool.Exec(ctx, `INSERT INTO admin_logins (tg_user_id, branch_location_id, logged_in_at) VALUES ($1, $2, now())`,
+		userID, matchedLocID,
+	)
+	return matchedLocID, true, nil
 }
 
 // AddBranchAdmin adds a new admin for a specific branch with a unique password (hash).
@@ -160,14 +174,21 @@ func AddBranchAdmin(ctx context.Context, branchLocationID int64, adminUserID int
 	return nil
 }
 
-// GetAdminLocationID returns the location (restaurant) ID for which the user is the branch admin, or 0 if none.
-// Used to validate that a restaurant admin only updates orders for their own restaurant.
+// GetAdminLocationID returns the location (restaurant) ID for which the user is acting as admin, or 0 if none.
+// Checks branch_admin_access first (anyone who logged in with the password), then branch_admins (primary admin).
 func GetAdminLocationID(ctx context.Context, adminUserID int64) (int64, error) {
 	if err := EnsureBranchAdminsTable(ctx); err != nil {
 		return 0, err
 	}
 	var locID int64
-	err := db.Pool.QueryRow(ctx, `SELECT branch_location_id FROM branch_admins WHERE admin_user_id = $1 LIMIT 1`, adminUserID).Scan(&locID)
+	err := db.Pool.QueryRow(ctx, `SELECT branch_location_id FROM branch_admin_access WHERE tg_user_id = $1`, adminUserID).Scan(&locID)
+	if err == nil && locID != 0 {
+		return locID, nil
+	}
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return 0, err
+	}
+	err = db.Pool.QueryRow(ctx, `SELECT branch_location_id FROM branch_admins WHERE admin_user_id = $1 LIMIT 1`, adminUserID).Scan(&locID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, nil
@@ -177,7 +198,7 @@ func GetAdminLocationID(ctx context.Context, adminUserID int64) (int64, error) {
 	return locID, nil
 }
 
-// GetBranchAdmins returns all admin user IDs for a specific branch
+// GetBranchAdmins returns all admin user IDs for a specific branch (primary only from branch_admins).
 func GetBranchAdmins(ctx context.Context, branchLocationID int64) ([]int64, error) {
 	if err := EnsureBranchAdminsTable(ctx); err != nil {
 		return nil, err
@@ -203,46 +224,111 @@ func GetBranchAdmins(ctx context.Context, branchLocationID int64) ([]int64, erro
 	return adminIDs, rows.Err()
 }
 
+// GetPrimaryAdminUserID returns the primary branch admin's tg_user_id for the branch (subscription holder). Returns 0 if not found.
+func GetPrimaryAdminUserID(ctx context.Context, branchLocationID int64) (int64, error) {
+	if err := EnsureBranchAdminsTable(ctx); err != nil {
+		return 0, err
+	}
+	var id int64
+	err := db.Pool.QueryRow(ctx, `SELECT admin_user_id FROM branch_admins WHERE branch_location_id = $1`, branchLocationID).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return id, nil
+}
+
+// MarkExpiredForBranch marks the primary admin's subscription as expired and sets their user_credentials.is_active = false (no password rotation).
+func MarkExpiredForBranch(ctx context.Context, branchLocationID int64) {
+	primaryID, err := GetPrimaryAdminUserID(ctx, branchLocationID)
+	if err != nil || primaryID == 0 {
+		return
+	}
+	MarkExpiredIfNeeded(ctx, primaryID, "restaurant_admin")
+}
+
 // BranchAdminWithLang is an admin user ID and the language they receive order cards in.
 type BranchAdminWithLang struct {
 	AdminUserID int64
 	OrderLang   string // "uz" or "ru"
 }
 
-// GetBranchAdminsWithLang returns all admins for a branch with their order_lang (for per-admin localized order cards).
+// GetBranchAdminsWithLang returns all admins for a branch with their order_lang: primary from branch_admins plus anyone in branch_admin_access for this branch (multi-user same password). Access users get primary's order_lang.
 func GetBranchAdminsWithLang(ctx context.Context, branchLocationID int64) ([]BranchAdminWithLang, error) {
 	if err := EnsureBranchAdminsTable(ctx); err != nil {
 		return nil, err
 	}
+	var primaryLang string
+	err := db.Pool.QueryRow(ctx, `SELECT COALESCE(NULLIF(TRIM(order_lang), ''), 'uz') FROM branch_admins WHERE branch_location_id = $1`, branchLocationID).Scan(&primaryLang)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("failed to get primary lang: %w", err)
+	}
+	if primaryLang != "ru" {
+		primaryLang = "uz"
+	}
+	seen := make(map[int64]bool)
+	var out []BranchAdminWithLang
 	rows, err := db.Pool.Query(ctx, `
-		SELECT admin_user_id, COALESCE(NULLIF(TRIM(order_lang), ''), 'uz') FROM branch_admins WHERE branch_location_id = $1`,
+		SELECT admin_user_id FROM branch_admins WHERE branch_location_id = $1`,
 		branchLocationID,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get branch admins with lang: %w", err)
+		return nil, fmt.Errorf("failed to get branch admins: %w", err)
 	}
-	defer rows.Close()
-	var out []BranchAdminWithLang
 	for rows.Next() {
-		var a BranchAdminWithLang
-		if err := rows.Scan(&a.AdminUserID, &a.OrderLang); err != nil {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		if a.OrderLang != "ru" {
-			a.OrderLang = "uz"
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, BranchAdminWithLang{AdminUserID: id, OrderLang: primaryLang})
 		}
-		out = append(out, a)
 	}
-	return out, rows.Err()
+	rows.Close()
+	rows2, err := db.Pool.Query(ctx, `
+		SELECT tg_user_id FROM branch_admin_access WHERE branch_location_id = $1`,
+		branchLocationID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get branch admin access: %w", err)
+	}
+	for rows2.Next() {
+		var id int64
+		if err := rows2.Scan(&id); err != nil {
+			rows2.Close()
+			return nil, err
+		}
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, BranchAdminWithLang{AdminUserID: id, OrderLang: primaryLang})
+		}
+	}
+	rows2.Close()
+	return out, rows2.Err()
 }
 
-// GetAdminOrderLang returns the order card language for an admin user ("uz" or "ru"). Returns "uz" if not found.
+// GetAdminOrderLang returns the order card language for an admin user ("uz" or "ru"). Checks branch_admins first, then branch_admin_access (uses branch's primary lang). Returns "uz" if not found.
 func GetAdminOrderLang(ctx context.Context, adminUserID int64) (string, error) {
 	if err := EnsureBranchAdminsTable(ctx); err != nil {
 		return "uz", err
 	}
 	var orderLang string
 	err := db.Pool.QueryRow(ctx, `SELECT COALESCE(NULLIF(TRIM(order_lang), ''), 'uz') FROM branch_admins WHERE admin_user_id = $1 LIMIT 1`, adminUserID).Scan(&orderLang)
+	if err == nil {
+		if orderLang != "ru" {
+			orderLang = "uz"
+		}
+		return orderLang, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "uz", err
+	}
+	// Access-only user: get branch and use that branch's order_lang
+	err = db.Pool.QueryRow(ctx, `SELECT COALESCE(NULLIF(TRIM(ba.order_lang), ''), 'uz') FROM branch_admin_access a JOIN branch_admins ba ON ba.branch_location_id = a.branch_location_id WHERE a.tg_user_id = $1 LIMIT 1`, adminUserID).Scan(&orderLang)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "uz", nil

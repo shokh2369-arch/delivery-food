@@ -1,15 +1,16 @@
 package models
 
 type CreateOrderInput struct {
-	UserID      int64
-	ChatID      string
-	Phone       string
-	Lat         float64
-	Lon         float64
-	DistanceKm  float64
-	DeliveryFee int64
-	ItemsTotal  int64
-	LocationID  int64 // restaurant (branch) this order belongs to
+	UserID       int64
+	ChatID       string
+	Phone        string
+	Lat          float64
+	Lon          float64
+	DistanceKm   float64
+	DeliveryFee  int64  // 0 for pickup
+	ItemsTotal   int64
+	LocationID   int64  // restaurant (branch) this order belongs to
+	DeliveryType string // "delivery" or "pickup", set by customer at checkout
 }
 
 // Order is a row from orders table (for status and location checks).
@@ -22,7 +23,7 @@ type Order struct {
 	GrandTotal   int64
 	DeliveryFee  int64   // taxi-style: base + per km
 	DistanceKm   float64 // for breakdown display
-	DeliveryType *string // 'pickup' or 'delivery', nil if not set
+	DeliveryType *string // 'pickup' or 'delivery', set by customer at checkout
 	DriverID     *string // set when driver accepted
 }
 

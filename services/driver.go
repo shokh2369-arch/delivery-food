@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"food-telegram/db"
 	"food-telegram/models"
@@ -17,12 +18,16 @@ const (
 
 // Driver represents a delivery driver.
 type Driver struct {
-	ID       string
-	TgUserID int64
-	ChatID   int64
-	Phone    string
-	CarPlate string
-	Status   string
+	ID        string
+	TgUserID  int64
+	ChatID    int64
+	FullName  string
+	Phone     string
+	CarPlate  string
+	CarModel  string
+	CarColor  string
+	Status    string
+	IsOnline  bool
 }
 
 // DriverLocation represents a driver's current location.
@@ -33,12 +38,12 @@ type DriverLocation struct {
 	UpdatedAt string
 }
 
-// RegisterDriver creates or updates a driver record.
+// RegisterDriver creates or updates a driver record (minimal; use CreateDriverProfile for full onboarding).
 func RegisterDriver(ctx context.Context, tgUserID int64, chatID int64) (*Driver, error) {
 	var id string
 	err := db.Pool.QueryRow(ctx, `
-		INSERT INTO drivers (tg_user_id, chat_id, status)
-		VALUES ($1, $2, $3)
+		INSERT INTO drivers (tg_user_id, chat_id, status, is_online)
+		VALUES ($1, $2, $3, false)
 		ON CONFLICT (tg_user_id) DO UPDATE SET chat_id = EXCLUDED.chat_id, updated_at = now()
 		RETURNING id`,
 		tgUserID, chatID, DriverStatusOffline,
@@ -49,14 +54,46 @@ func RegisterDriver(ctx context.Context, tgUserID int64, chatID int64) (*Driver,
 	return &Driver{ID: id, TgUserID: tgUserID, ChatID: chatID, Status: DriverStatusOffline}, nil
 }
 
+// CreateDriverProfile creates a new driver with full profile (onboarding). Returns the driver or error if tg_user_id already exists.
+func CreateDriverProfile(ctx context.Context, tgUserID, chatID int64, fullName, phone, carPlate, carModel, carColor string, lat, lon *float64) (*Driver, error) {
+	var id string
+	err := db.Pool.QueryRow(ctx, `
+		INSERT INTO drivers (tg_user_id, chat_id, full_name, phone, car_plate, car_model, car_color, status, is_online)
+		VALUES ($1, $2, NULLIF(TRIM($3), ''), NULLIF(TRIM($4), ''), NULLIF(TRIM($5), ''), NULLIF(TRIM($6), ''), NULLIF(TRIM($7), ''), $8, false)
+		RETURNING id`,
+		tgUserID, chatID, fullName, phone, carPlate, carModel, carColor, DriverStatusOffline,
+	).Scan(&id)
+	if err != nil {
+		return nil, fmt.Errorf("create driver: %w", err)
+	}
+	d := &Driver{
+		ID: id, TgUserID: tgUserID, ChatID: chatID,
+		FullName: strings.TrimSpace(fullName), Phone: strings.TrimSpace(phone),
+		CarPlate: strings.TrimSpace(carPlate), CarModel: strings.TrimSpace(carModel), CarColor: strings.TrimSpace(carColor),
+		Status: DriverStatusOffline,
+	}
+	if lat != nil && lon != nil {
+		_, _ = db.Pool.Exec(ctx, `
+			INSERT INTO driver_locations (driver_id, lat, lon, updated_at)
+			VALUES ($1, $2, $3, now())
+			ON CONFLICT (driver_id) DO UPDATE SET lat = EXCLUDED.lat, lon = EXCLUDED.lon, updated_at = now()`,
+			id, *lat, *lon,
+		)
+	}
+	return d, nil
+}
+
 // GetDriverByTgUserID loads a driver by Telegram user ID.
 func GetDriverByTgUserID(ctx context.Context, tgUserID int64) (*Driver, error) {
 	var d Driver
 	err := db.Pool.QueryRow(ctx, `
-		SELECT id, tg_user_id, chat_id, COALESCE(phone, ''), COALESCE(car_plate, ''), status
+		SELECT id, tg_user_id, chat_id,
+		       COALESCE(full_name, ''), COALESCE(phone, ''), COALESCE(car_plate, ''),
+		       COALESCE(car_model, ''), COALESCE(car_color, ''),
+		       status, COALESCE(is_online, false)
 		FROM drivers WHERE tg_user_id = $1`,
 		tgUserID,
-	).Scan(&d.ID, &d.TgUserID, &d.ChatID, &d.Phone, &d.CarPlate, &d.Status)
+	).Scan(&d.ID, &d.TgUserID, &d.ChatID, &d.FullName, &d.Phone, &d.CarPlate, &d.CarModel, &d.CarColor, &d.Status, &d.IsOnline)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -70,10 +107,13 @@ func GetDriverByTgUserID(ctx context.Context, tgUserID int64) (*Driver, error) {
 func GetDriverByID(ctx context.Context, driverID string) (*Driver, error) {
 	var d Driver
 	err := db.Pool.QueryRow(ctx, `
-		SELECT id, tg_user_id, chat_id, COALESCE(phone, ''), COALESCE(car_plate, ''), status
+		SELECT id, tg_user_id, chat_id,
+		       COALESCE(full_name, ''), COALESCE(phone, ''), COALESCE(car_plate, ''),
+		       COALESCE(car_model, ''), COALESCE(car_color, ''),
+		       status, COALESCE(is_online, false)
 		FROM drivers WHERE id = $1`,
 		driverID,
-	).Scan(&d.ID, &d.TgUserID, &d.ChatID, &d.Phone, &d.CarPlate, &d.Status)
+	).Scan(&d.ID, &d.TgUserID, &d.ChatID, &d.FullName, &d.Phone, &d.CarPlate, &d.CarModel, &d.CarColor, &d.Status, &d.IsOnline)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -83,14 +123,21 @@ func GetDriverByID(ctx context.Context, driverID string) (*Driver, error) {
 	return &d, nil
 }
 
-// UpdateDriverStatus updates driver status (online/offline).
+// UpdateDriverChatID sets the driver's chat_id (e.g. when they first message the bot after being added with chat_id=0).
+func UpdateDriverChatID(ctx context.Context, driverID string, chatID int64) error {
+	_, err := db.Pool.Exec(ctx, `UPDATE drivers SET chat_id = $1, updated_at = now() WHERE id = $2`, chatID, driverID)
+	return err
+}
+
+// UpdateDriverStatus updates driver status (online/offline) and is_online.
 func UpdateDriverStatus(ctx context.Context, driverID string, status string) error {
 	if status != DriverStatusOnline && status != DriverStatusOffline {
 		return fmt.Errorf("invalid driver status: %s", status)
 	}
+	isOnline := status == DriverStatusOnline
 	_, err := db.Pool.Exec(ctx, `
-		UPDATE drivers SET status = $1, updated_at = now() WHERE id = $2`,
-		status, driverID,
+		UPDATE drivers SET status = $1, is_online = $2, updated_at = now() WHERE id = $3`,
+		status, isOnline, driverID,
 	)
 	return err
 }
@@ -239,15 +286,15 @@ func GetNearbyOnlineDriversForOrder(ctx context.Context, orderLat, orderLon floa
 		FROM drivers d
 		INNER JOIN driver_locations dl ON dl.driver_id = d.id
 		  AND dl.updated_at >= now() - interval '5 minutes'
-		WHERE d.status = $3
+		WHERE d.is_online = true
 		  AND (6371 * acos(
 		      cos(radians($1)) * cos(radians(dl.lat)) *
 		      cos(radians(dl.lon) - radians($2)) +
 		      sin(radians($1)) * sin(radians(dl.lat))
-		  )) <= $4
+		  )) <= $3
 		ORDER BY distance_km ASC
-		LIMIT $5`,
-		orderLat, orderLon, DriverStatusOnline, radiusKm, limit,
+		LIMIT $4`,
+		orderLat, orderLon, radiusKm, limit,
 	)
 	if err != nil {
 		return nil, err

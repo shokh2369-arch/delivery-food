@@ -53,14 +53,28 @@ func BuildAdminCard(o *models.Order, driver *Driver, adminLang string) OrderCard
 	statusLabel := statusLabelAdmin(adminLang, o.Status)
 	text := fmt.Sprintf(lang.T(adminLang, "adm_order_id"), o.ID) + "\n\n"
 	text += fmt.Sprintf(lang.T(adminLang, "adm_total"), o.ItemsTotal) + "\n"
+	deliveryTypeLabel := "PICKUP"
+	if o.DeliveryType != nil && *o.DeliveryType == "delivery" {
+		deliveryTypeLabel = "DELIVERY"
+	}
+	text += fmt.Sprintf("Type: %s\n", deliveryTypeLabel)
 	text += fmt.Sprintf(lang.T(adminLang, "adm_status"), statusLabel)
 	if driver != nil {
 		text += "\n\n" + lang.T(adminLang, "adm_driver_accepted")
+		if driver.FullName != "" {
+			text += "\nIsm: " + driver.FullName
+		}
 		if driver.Phone != "" {
-			text += "\nPhone: " + driver.Phone
+			text += "\nTel: " + driver.Phone
 		}
 		if driver.CarPlate != "" {
-			text += "\nCar: " + driver.CarPlate
+			text += "\nMashina raqami: " + driver.CarPlate
+		}
+		if driver.CarModel != "" {
+			text += "\nMashina modeli: " + driver.CarModel
+		}
+		if driver.CarColor != "" {
+			text += "\nRangi: " + driver.CarColor
 		}
 	} else if o.Status == OrderStatusReady && o.DeliveryType != nil && *o.DeliveryType == "delivery" {
 		text += "\n\n⏳ Haydovchi kutilmoqda..."
@@ -78,17 +92,12 @@ func BuildAdminCard(o *models.Order, driver *Driver, adminLang string) OrderCard
 			{{Text: lang.T(adminLang, "adm_mark_ready"), CallbackData: "order_status:" + strconv.FormatInt(o.ID, 10) + ":" + OrderStatusReady}},
 		}
 	case OrderStatusReady:
-		if o.DeliveryType == nil {
-			buttons = [][]OrderCardButton{
-				{{Text: lang.T(adminLang, "adm_send_delivery"), CallbackData: "delivery_type:" + strconv.FormatInt(o.ID, 10) + ":delivery"},
-					{Text: lang.T(adminLang, "adm_customer_pickup"), CallbackData: "delivery_type:" + strconv.FormatInt(o.ID, 10) + ":pickup"}},
-			}
-		} else if *o.DeliveryType == "pickup" {
+		if o.DeliveryType != nil && *o.DeliveryType == "pickup" {
 			buttons = [][]OrderCardButton{
 				{{Text: lang.T(adminLang, "adm_mark_completed"), CallbackData: "order_status:" + strconv.FormatInt(o.ID, 10) + ":" + OrderStatusCompleted}},
 			}
 		}
-		// delivery chosen: no buttons (driver will accept; no completed button when driver_id set)
+		// delivery: no buttons (driver will accept; push happens on Mark Ready)
 	}
 	return OrderCardContent{Text: text, Buttons: buttons}
 }
@@ -97,7 +106,12 @@ func BuildAdminCard(o *models.Order, driver *Driver, adminLang string) OrderCard
 func BuildCustomerCard(o *models.Order, driver *Driver, trackURL string) OrderCardContent {
 	text := fmt.Sprintf("Buyurtma #%d\n\n", o.ID)
 	text += fmt.Sprintf("🛒 Mahsulotlar: %d so'm\n", o.ItemsTotal)
-	text += fmt.Sprintf("💵 Jami: %d so'm\n\n", o.GrandTotal)
+	text += fmt.Sprintf("💵 Jami: %d so'm\n", o.GrandTotal)
+	typeLabel := "O'zim olib ketaman"
+	if o.DeliveryType != nil && *o.DeliveryType == "delivery" {
+		typeLabel = "Yetkazib berish"
+	}
+	text += fmt.Sprintf("Tur: %s\n\n", typeLabel)
 	text += "Holat: "
 	switch o.Status {
 	case OrderStatusNew:
@@ -106,6 +120,9 @@ func BuildCustomerCard(o *models.Order, driver *Driver, trackURL string) OrderCa
 		text += "Tayyorlanmoqda"
 	case OrderStatusReady:
 		text += "Tayyor"
+		if o.DeliveryType != nil && *o.DeliveryType == "pickup" {
+			text += "\n\n" + lang.T(lang.Uz, "pickup_ready")
+		}
 	case OrderStatusAssigned:
 		text += "Haydovchi topildi"
 	case OrderStatusPickedUp:
@@ -121,11 +138,14 @@ func BuildCustomerCard(o *models.Order, driver *Driver, trackURL string) OrderCa
 	}
 	if driver != nil {
 		text += "\n\nHaydovchi"
-		if driver.Phone != "" {
-			text += "\n📞 " + driver.Phone
+		if driver.FullName != "" {
+			text += "\n👤 " + driver.FullName
+		}
+		if driver.CarModel != "" {
+			text += "\n🚗 " + driver.CarModel
 		}
 		if driver.CarPlate != "" {
-			text += "\n🚗 " + driver.CarPlate
+			text += "\n🔢 " + driver.CarPlate
 		}
 	}
 

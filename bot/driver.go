@@ -14,16 +14,31 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// DriverBot handles driver interactions (uses DRIVER_BOT_TOKEN).
+// driverRegState holds step-by-step registration (no password; auth by Telegram ID).
+type driverRegState struct {
+	Step     string  // "full_name", "phone", "car_plate", "car_model", "car_color", "location"
+	FullName string
+	Phone    string
+	CarPlate string
+	CarModel string
+	CarColor string
+	Lat      *float64
+	Lon      *float64
+}
+
+// DriverBot handles driver interactions (uses DRIVER_BOT_TOKEN). Auth by Telegram ID (driver row exists). No password.
 type DriverBot struct {
-	api            *tgbotapi.BotAPI
-	mainBot        *tgbotapi.BotAPI // for sending customer notifications
-	messageBot     *tgbotapi.BotAPI // for sending admin notifications
-	config         *config.Config
-	stateMu        sync.RWMutex
-	driverLang     map[int64]string // "uz" or "ru"
-	driverLangMu   sync.RWMutex
-	onOrderUpdated func(orderID int64) // called after order change so main bot can refresh order cards
+	api                   *tgbotapi.BotAPI
+	mainBot                *tgbotapi.BotAPI
+	messageBot             *tgbotapi.BotAPI
+	config                 *config.Config
+	stateMu                sync.RWMutex
+	driverLang             map[int64]string
+	driverLangMu           sync.RWMutex
+	driverReg              map[int64]*driverRegState
+	onOrderUpdated         func(orderID int64)
+	onSubscriptionExpired   func(tgUserID int64, role string)
+	onRenewalRequest       func(tgUserID int64, role string)
 }
 
 // NewDriverBot creates a driver bot using DRIVER_BOT_TOKEN.
@@ -36,11 +51,12 @@ func NewDriverBot(cfg *config.Config, mainBotAPI *tgbotapi.BotAPI, messageBotAPI
 		return nil, err
 	}
 	return &DriverBot{
-		api:         api,
-		mainBot:     mainBotAPI,
-		messageBot:  messageBotAPI,
-		config:      cfg,
-		driverLang:  make(map[int64]string),
+		api:           api,
+		mainBot:       mainBotAPI,
+		messageBot:    messageBotAPI,
+		config:        cfg,
+		driverLang: make(map[int64]string),
+		driverReg:  make(map[int64]*driverRegState),
 	}, nil
 }
 
@@ -52,6 +68,16 @@ func (d *DriverBot) GetAPI() *tgbotapi.BotAPI {
 // SetOnOrderUpdated sets the callback invoked after an order is updated (accept/status/complete) so main bot can refresh order cards.
 func (d *DriverBot) SetOnOrderUpdated(f func(orderID int64)) {
 	d.onOrderUpdated = f
+}
+
+// SetOnSubscriptionExpired sets the callback when a driver's subscription expires (e.g. adder notifies superadmin with renew button).
+func (d *DriverBot) SetOnSubscriptionExpired(f func(tgUserID int64, role string)) {
+	d.onSubscriptionExpired = f
+}
+
+// SetOnRenewalRequest sets the callback when an expired user presses "Yangilash so'rovini yuborish" (sends request to superadmin).
+func (d *DriverBot) SetOnRenewalRequest(f func(tgUserID int64, role string)) {
+	d.onRenewalRequest = f
 }
 
 func (d *DriverBot) getLang(userID int64) string {
@@ -104,8 +130,39 @@ func (d *DriverBot) Start() {
 			continue
 		}
 
+		ctx := context.Background()
+		driver, _ := services.GetDriverByTgUserID(ctx, userID)
+		if driver != nil && driver.ChatID == 0 {
+			_ = services.UpdateDriverChatID(ctx, driver.ID, msg.Chat.ID)
+			driver.ChatID = msg.Chat.ID
+		}
 
-		// Handle location updates (for online drivers)
+		// Registration flow (driver does not exist yet)
+		if driver == nil {
+			if d.handleRegFlow(msg, userID, text, nil, nil) {
+				continue
+			}
+			// Contact share for phone step
+			if msg.Contact != nil {
+				phone := msg.Contact.PhoneNumber
+				if msg.Contact.UserID != 0 && msg.Contact.UserID != userID {
+					phone = ""
+				}
+				if d.handleRegFlow(msg, userID, "", &phone, nil) {
+					continue
+				}
+			}
+			if msg.Location != nil {
+				lat, lon := msg.Location.Latitude, msg.Location.Longitude
+				if d.handleRegFlow(msg, userID, "", nil, &[]float64{lat, lon}) {
+					continue
+				}
+			}
+			d.send(msg.Chat.ID, "Ro'yxatdan o'tish uchun /start bosing.")
+			continue
+		}
+
+		// Driver exists → auth by Telegram ID. Handle location for online drivers.
 		if msg.Location != nil {
 			d.handleLocation(msg.Chat.ID, userID, msg.Location.Latitude, msg.Location.Longitude)
 			continue
@@ -130,19 +187,166 @@ func (d *DriverBot) sendWithInline(chatID int64, text string, kb tgbotapi.Inline
 	}
 }
 
+func (d *DriverBot) sendWithReplyKeyboard(chatID int64, text string, kb tgbotapi.ReplyKeyboardMarkup) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = kb
+	if _, err := d.api.Send(msg); err != nil {
+		log.Printf("driver bot send error: %v", err)
+	}
+}
+
+func (d *DriverBot) sendRemoveKeyboard(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = tgbotapi.NewRemoveKeyboard(true)
+	if _, err := d.api.Send(msg); err != nil {
+		log.Printf("driver bot send error: %v", err)
+	}
+}
+
+func (d *DriverBot) sendExpiredWithContactButton(chatID int64, tgUserID int64, denyMsg string) {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("📋 Yangilash so'rovini yuborish", "exp_contact")),
+	)
+	d.sendWithInline(chatID, denyMsg, kb)
+	if d.onSubscriptionExpired != nil {
+		d.onSubscriptionExpired(tgUserID, services.UserRoleDriver)
+	}
+}
+
+// SendExpiredToUser sends the subscription-expired message with renewal button to the user (used by background job).
+func (d *DriverBot) SendExpiredToUser(chatID int64, tgUserID int64) {
+	if chatID == 0 {
+		return
+	}
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("📋 Yangilash so'rovini yuborish", "exp_contact")),
+	)
+	d.sendWithInline(chatID, services.SubscriptionDenyMessage, kb)
+	if d.onSubscriptionExpired != nil {
+		d.onSubscriptionExpired(tgUserID, services.UserRoleDriver)
+	}
+}
+
+// handleRegFlow handles registration steps. Returns true if message was consumed.
+// phoneOrNil and locationOrNil are for contact share and location (optional step).
+func (d *DriverBot) handleRegFlow(msg *tgbotapi.Message, userID int64, text string, phoneOrNil *string, locationOrNil *[]float64) bool {
+	d.stateMu.Lock()
+	st := d.driverReg[userID]
+	d.stateMu.Unlock()
+	if st == nil {
+		return false
+	}
+	chatID := msg.Chat.ID
+
+	switch st.Step {
+	case "full_name":
+		st.FullName = strings.TrimSpace(text)
+		if st.FullName == "" {
+			return false
+		}
+		st.Step = "phone"
+		d.stateMu.Lock()
+		d.driverReg[userID] = st
+		d.stateMu.Unlock()
+		kb := tgbotapi.NewReplyKeyboard(
+			tgbotapi.NewKeyboardButtonRow(tgbotapi.NewKeyboardButtonContact("📱 Raqamni ulashish")),
+		)
+		kb.ResizeKeyboard = true
+		kb.OneTimeKeyboard = true
+		d.sendWithReplyKeyboard(chatID, "📱 Telefon raqamingizni yuboring yoki tugma orqali ulashing:", kb)
+		return true
+	case "phone":
+		if phoneOrNil != nil {
+			st.Phone = strings.TrimSpace(*phoneOrNil)
+		} else {
+			st.Phone = strings.TrimSpace(text)
+		}
+		st.Step = "car_plate"
+		d.stateMu.Lock()
+		d.driverReg[userID] = st
+		d.stateMu.Unlock()
+		d.sendRemoveKeyboard(chatID, "✅")
+		d.send(chatID, "🚗 Mashina raqami (rus raqami):")
+		return true
+	case "car_plate":
+		st.CarPlate = strings.TrimSpace(text)
+		st.Step = "car_model"
+		d.stateMu.Lock()
+		d.driverReg[userID] = st
+		d.stateMu.Unlock()
+		d.send(chatID, "🚙 Mashina modeli (masalan: Chevrolet Lacetti):")
+		return true
+	case "car_model":
+		st.CarModel = strings.TrimSpace(text)
+		st.Step = "car_color"
+		d.stateMu.Lock()
+		d.driverReg[userID] = st
+		d.stateMu.Unlock()
+		d.send(chatID, "🎨 Mashina rangi:")
+		return true
+	case "car_color":
+		st.CarColor = strings.TrimSpace(text)
+		st.Step = "location"
+		d.stateMu.Lock()
+		d.driverReg[userID] = st
+		d.stateMu.Unlock()
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("✅ Tugatish (lokatsiya ixtiyoriy)", "driver_reg_skip_loc")),
+		)
+		d.sendWithInline(chatID, "📍 Lokatsiyangizni yuboring (ixtiyoriy, lekin tavsiya etiladi):", kb)
+		return true
+	case "location":
+		if locationOrNil != nil && len(*locationOrNil) >= 2 {
+			st.Lat = &(*locationOrNil)[0]
+			st.Lon = &(*locationOrNil)[1]
+		}
+		// Complete registration
+		d.stateMu.Lock()
+		delete(d.driverReg, userID)
+		d.stateMu.Unlock()
+		ctx := context.Background()
+		var lat, lon *float64
+		if st.Lat != nil && st.Lon != nil {
+			lat, lon = st.Lat, st.Lon
+		}
+		driver, err := services.CreateDriverProfile(ctx, userID, chatID, st.FullName, st.Phone, st.CarPlate, st.CarModel, st.CarColor, lat, lon)
+		if err != nil {
+			d.send(chatID, "❌ "+err.Error())
+			return true
+		}
+		d.send(chatID, "✅ Ro'yxatdan o'tdingiz. Endi Go Online qilishingiz mumkin.")
+		d.sendDriverPanel(chatID, driver)
+		return true
+	}
+	return false
+}
+
 func (d *DriverBot) handleStart(chatID int64, userID int64) {
-	// Always show language selection on /start
+	ctx := context.Background()
+	driver, _ := services.GetDriverByTgUserID(ctx, userID)
+	if driver != nil {
+		if driver.ChatID == 0 {
+			_ = services.UpdateDriverChatID(ctx, driver.ID, chatID)
+			driver.ChatID = chatID
+		}
+		d.sendDriverPanel(chatID, driver)
+		return
+	}
+	d.stateMu.Lock()
+	st := d.driverReg[userID]
+	d.stateMu.Unlock()
+	if st != nil {
+		d.send(chatID, "Ro'yxatdan o'tishni davom ettiring.")
+		return
+	}
+	// New user: language then registration
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("O'zbek", "lang:uz"),
 			tgbotapi.NewInlineKeyboardButtonData("Русский", "lang:ru"),
 		),
 	)
-	msg := tgbotapi.NewMessage(chatID, lang.T(lang.Uz, "choose_lang_both"))
-	msg.ReplyMarkup = kb
-	if _, err := d.api.Send(msg); err != nil {
-		log.Printf("driver bot send error: %v", err)
-	}
+	d.sendWithInline(chatID, lang.T(lang.Uz, "choose_lang_both"), kb)
 }
 
 func (d *DriverBot) sendDriverPanel(chatID int64, driver *services.Driver) {
@@ -150,17 +354,17 @@ func (d *DriverBot) sendDriverPanel(chatID int64, driver *services.Driver) {
 }
 
 func (d *DriverBot) sendDriverPanelWithLocation(chatID int64, driver *services.Driver, knownLocation *services.DriverLocation) {
+	ctx := context.Background()
 	l := d.getLang(driver.TgUserID)
 	if l == "" {
 		l = lang.Uz
 	}
 	statusEmoji := "🟢"
-	if driver.Status == services.DriverStatusOffline {
+	if driver.Status != services.DriverStatusOnline {
 		statusEmoji = "🔴"
 	}
 	text := fmt.Sprintf(lang.T(l, "dr_panel"), statusEmoji, driver.Status)
 
-	ctx := context.Background()
 	hasLocation := false
 	var loc *services.DriverLocation
 	if knownLocation != nil {
@@ -251,17 +455,45 @@ func (d *DriverBot) handleCallback(cq *tgbotapi.CallbackQuery) {
 
 	d.api.Request(tgbotapi.NewCallback(cq.ID, ""))
 
-	// Language selection (before driver is required)
+	if data == "driver_reg_skip_loc" {
+		d.stateMu.Lock()
+		st := d.driverReg[userID]
+		d.stateMu.Unlock()
+		if st != nil && st.Step == "location" {
+			d.stateMu.Lock()
+			delete(d.driverReg, userID)
+			d.stateMu.Unlock()
+			ctx := context.Background()
+			driver, err := services.CreateDriverProfile(ctx, userID, chatID, st.FullName, st.Phone, st.CarPlate, st.CarModel, st.CarColor, nil, nil)
+			if err != nil {
+				d.send(chatID, "❌ "+err.Error())
+				return
+			}
+			d.send(chatID, "✅ Ro'yxatdan o'tdingiz. Endi Go Online qilishingiz mumkin.")
+			d.sendDriverPanel(chatID, driver)
+		}
+		return
+	}
+	if data == "exp_contact" {
+		d.send(chatID, "Haydovchilar uchun abonement yo'q.")
+		return
+	}
+
+	// Language selection
 	if data == "lang:uz" || data == "lang:ru" {
 		langCode := strings.TrimPrefix(data, "lang:")
 		d.setLang(userID, langCode)
 		ctx := context.Background()
-		driver, err := services.RegisterDriver(ctx, userID, chatID)
-		if err != nil {
-			d.sendLang(chatID, userID, "dr_error", err.Error())
+		driver, _ := services.GetDriverByTgUserID(ctx, userID)
+		if driver != nil {
+			d.sendDriverPanel(chatID, driver)
 			return
 		}
-		d.sendDriverPanel(chatID, driver)
+		// No driver: start registration
+		d.stateMu.Lock()
+		d.driverReg[userID] = &driverRegState{Step: "full_name"}
+		d.stateMu.Unlock()
+		d.send(chatID, "👋 Haydovchi sifatida ro'yxatdan o'tish.\n\nIsm familyangizni yuboring:")
 		return
 	}
 

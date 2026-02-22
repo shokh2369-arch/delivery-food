@@ -38,16 +38,27 @@ type addBranchAdminState struct {
 	Step                string // "admin_id", "password", "order_lang"
 }
 
-// AdderBot is the admin bot for adding menu items (uses ADDER_TOKEN). Big admin uses LOGIN; branch admins use their unique password.
+// Admin (Adder) bot: password-only entry; no application form, no password sending. Applications and password delivery are in Zayavka only.
+const (
+	adderLoginPrompt         = "🔒 Kirish uchun parolni kiriting.\nParolni Zayavka bot orqali olasiz."
+	adderRequireLoginMsg     = "🔒 Avval /login orqali kiring."
+	adderSubscriptionExpiredMsg = "❌ Abonement tugagan.\nYangilash uchun Zayavka bot orqali so'rov yuboring."
+)
+
+// AdderBot is the admin bot: password login and admin panel only. No application form; no password generation/sending.
 type AdderBot struct {
 	api               *tgbotapi.BotAPI
+	zayafkaAPI        *tgbotapi.BotAPI // optional: send password/rejection to applicant via Zayafka (they applied there)
+	cfg               *config.Config
 	login             string
 	superAdminID      int64
 	state             map[int64]*adderState
 	locState          map[int64]*locationAdderState
-	addBranchAdmin    map[int64]*addBranchAdminState
-	activeLocation    map[int64]int64 // per-admin selected location for menu items
-	stateMu           sync.RWMutex
+	addBranchAdmin  map[int64]*addBranchAdminState
+	activeLocation  map[int64]int64 // per-admin selected location for menu items
+	expiredNotified      map[string]bool // "tg_user_id:role" -> already sent superadmin expiry notification
+	onSubscriptionRenewed func(tgUserID int64, role string) // clear background-job "already notified" so next expiry can notify again
+	stateMu              sync.RWMutex
 }
 
 // NewAdderBot creates an adder bot using ADDER_TOKEN. superAdminID is the big admin (ADMIN_ID); they use LOGIN. Branch admins log in with their unique password.
@@ -59,14 +70,20 @@ func NewAdderBot(cfg *config.Config, superAdminID int64) (*AdderBot, error) {
 	if err != nil {
 		return nil, err
 	}
+	sid := cfg.Telegram.SuperadminID
+	if sid == 0 {
+		sid = superAdminID
+	}
 	return &AdderBot{
-		api:            api,
-		login:          strings.TrimSpace(cfg.Telegram.Login),
-		superAdminID:   superAdminID,
-		state:          make(map[int64]*adderState),
-		locState:       make(map[int64]*locationAdderState),
+		api:               api,
+		cfg:               cfg,
+		login:             strings.TrimSpace(cfg.Telegram.Login),
+		superAdminID:      sid,
+		state:             make(map[int64]*adderState),
+		locState:          make(map[int64]*locationAdderState),
 		addBranchAdmin: make(map[int64]*addBranchAdminState),
 		activeLocation: make(map[int64]int64),
+		expiredNotified:   make(map[string]bool),
 	}, nil
 }
 
@@ -96,27 +113,189 @@ func (a *AdderBot) Start() {
 			a.handleStart(msg.Chat.ID, userID)
 			continue
 		}
+		if text == "/apply" {
+			a.send(msg.Chat.ID, "📋 Ariza yuborish uchun Zayafka botidan foydalaning.")
+			continue
+		}
+		if text == "/applications" {
+			a.handleApplicationsCommand(msg.Chat.ID, userID)
+			continue
+		}
+		if a.superAdminID != 0 && userID == a.superAdminID {
+			if text == "/subs_pending" {
+				a.handleSubsPending(msg.Chat.ID)
+				continue
+			}
+			if strings.HasPrefix(text, "/renew ") {
+				a.handleRenew(msg.Chat.ID, userID, strings.TrimSpace(text[6:]))
+				continue
+			}
+			if strings.HasPrefix(text, "/reset_password ") {
+				a.handleResetPassword(msg.Chat.ID, strings.TrimSpace(text[15:]))
+				continue
+			}
+			if strings.HasPrefix(text, "/sub_info ") {
+				a.handleSubInfo(msg.Chat.ID, strings.TrimSpace(text[9:]))
+				continue
+			}
+			if strings.HasPrefix(text, "/pause ") {
+				a.handlePause(msg.Chat.ID, strings.TrimSpace(text[6:]))
+				continue
+			}
+			if strings.HasPrefix(text, "/unpause ") {
+				a.handleUnpause(msg.Chat.ID, strings.TrimSpace(text[8:]))
+				continue
+			}
+			if strings.HasPrefix(text, "/add_driver ") {
+				a.handleAddDriver(msg.Chat.ID, strings.TrimSpace(text[11:]))
+				continue
+			}
+		}
+		if text == "/login" {
+			a.send(msg.Chat.ID, adderLoginPrompt)
+			continue
+		}
 
-		// Check if user is logged in
+		// Not logged in: only password entry (no application flow; that is in Zayavka only).
 		if !a.isLoggedIn(userID) {
-			// Treat message as password attempt: big admin uses LOGIN; branch admins use their unique password
-			if a.superAdminID != 0 && userID == a.superAdminID && a.login != "" && text == a.login {
-				a.setLoggedIn(userID, "super")
-				a.sendAdminPanel(msg.Chat.ID, userID)
-			} else if locID, ok, err := services.AuthenticateBranchAdmin(context.Background(), userID, text); err == nil && ok {
-				a.setLoggedIn(userID, "branch")
-				a.stateMu.Lock()
-				a.activeLocation[userID] = locID
-				a.stateMu.Unlock()
-				locName, _ := services.GetLocationName(context.Background(), locID)
-				if locName != "" {
-					a.send(msg.Chat.ID, "✅ Logged in to «"+locName+"». You can add or edit menu items for your place.")
+			ctx := context.Background()
+			// Superadmin can always log in with LOGIN password first
+			if a.superAdminID != 0 && userID == a.superAdminID && a.login != "" {
+				if wait, _ := services.LoginThrottleWaitSeconds(ctx, userID, services.ThrottleRoleSuperadmin); wait > 0 {
+					a.send(msg.Chat.ID, fmt.Sprintf("⏳ Iltimos %d soniya kutib qayta urinib ko'ring.", wait))
+					continue
 				}
-				a.sendAdminPanel(msg.Chat.ID, userID)
+				if text == a.login {
+					_ = services.RecordLoginSuccess(ctx, userID, services.ThrottleRoleSuperadmin)
+					a.setLoggedIn(userID, "super")
+					a.sendAdminPanel(msg.Chat.ID, userID)
+					continue
+				}
+			}
+			// Approved applicant or has credential: try login
+			hasCred, _ := services.HasApprovedCredential(ctx, userID, services.UserRoleRestaurantAdmin)
+			credExists, _ := services.CredentialExists(ctx, userID, services.UserRoleRestaurantAdmin)
+			if hasCred || credExists {
+				if wait, _ := services.LoginThrottleWaitSeconds(ctx, userID, services.ThrottleRoleRestaurantAdmin); wait > 0 {
+					a.send(msg.Chat.ID, fmt.Sprintf("⏳ Iltimos %d soniya kutib qayta urinib ko'ring.", wait))
+					continue
+				}
+				ok, _ := services.VerifyCredential(ctx, userID, services.UserRoleRestaurantAdmin, text)
+				if ok {
+					_ = services.RecordLoginSuccess(ctx, userID, services.ThrottleRoleRestaurantAdmin)
+					services.MarkExpiredIfNeeded(ctx, userID, services.UserRoleRestaurantAdmin)
+					subOk, subMsg := services.RequireActiveSubscription(ctx, userID, services.UserRoleRestaurantAdmin)
+					if !subOk {
+						a.sendExpiredUserAndNotifySuperadmin(msg.Chat.ID, userID, services.UserRoleRestaurantAdmin, subMsg)
+						continue
+					}
+					a.setLoggedIn(userID, "branch")
+					locID, _ := services.GetAdminLocationID(ctx, userID)
+					a.stateMu.Lock()
+					a.activeLocation[userID] = locID
+					a.stateMu.Unlock()
+					a.send(msg.Chat.ID, "✅ Kirish muvaffaqiyatli.")
+					if within, warn := services.SubscriptionExpiresWithinDays(ctx, userID, services.UserRoleRestaurantAdmin, 3); within && warn != "" {
+						a.send(msg.Chat.ID, warn)
+					}
+					a.sendAdminPanel(msg.Chat.ID, userID)
+				} else {
+					_ = services.RecordLoginFailed(ctx, userID, services.ThrottleRoleRestaurantAdmin)
+					if correctInactive, _ := services.PasswordCorrectButInactive(ctx, userID, services.UserRoleRestaurantAdmin, text); correctInactive {
+						a.sendExpiredUserAndNotifySuperadmin(msg.Chat.ID, userID, services.UserRoleRestaurantAdmin, adderSubscriptionExpiredMsg)
+					} else {
+						a.send(msg.Chat.ID, "❌ Noto'g'ri parol. "+adderLoginPrompt)
+					}
+				}
+				continue
+			}
+			// Application status gating (only for users without approved credential)
+			if status, _ := services.GetUserApplicationStatus(ctx, userID, services.ApplicationTypeRestaurantAdmin); status == services.ApplicationStatusPending {
+				a.send(msg.Chat.ID, "⏳ Arizangiz ko'rib chiqilmoqda.")
+				continue
+			}
+			if status, _ := services.GetUserApplicationStatus(ctx, userID, services.ApplicationTypeRestaurantAdmin); status == services.ApplicationStatusRejected {
+				if a.superAdminID != 0 && userID == a.superAdminID && a.login != "" {
+					if wait, _ := services.LoginThrottleWaitSeconds(ctx, userID, services.ThrottleRoleSuperadmin); wait > 0 {
+						a.send(msg.Chat.ID, fmt.Sprintf("⏳ Iltimos %d soniya kutib qayta urinib ko'ring.", wait))
+						continue
+					}
+					if text == a.login {
+						_ = services.RecordLoginSuccess(ctx, userID, services.ThrottleRoleSuperadmin)
+						a.setLoggedIn(userID, "super")
+						a.sendAdminPanel(msg.Chat.ID, userID)
+						continue
+					}
+				}
+				if wait, _ := services.LoginThrottleWaitSeconds(ctx, userID, services.ThrottleRoleRestaurantAdmin); wait > 0 {
+					a.send(msg.Chat.ID, fmt.Sprintf("⏳ Iltimos %d soniya kutib qayta urinib ko'ring.", wait))
+					continue
+				}
+				if locID, ok, err := services.AuthenticateBranchAdmin(ctx, userID, text); err == nil && ok {
+					_ = services.RecordLoginSuccess(ctx, userID, services.ThrottleRoleRestaurantAdmin)
+					a.setLoggedIn(userID, "branch")
+					a.stateMu.Lock()
+					a.activeLocation[userID] = locID
+					a.stateMu.Unlock()
+					locName, _ := services.GetLocationName(ctx, locID)
+					if locName != "" {
+						a.send(msg.Chat.ID, "✅ Logged in to «"+locName+"». You can add or edit menu items for your place.")
+					}
+					a.sendAdminPanel(msg.Chat.ID, userID)
+					continue
+				}
+				_ = services.RecordLoginFailed(ctx, userID, services.ThrottleRoleRestaurantAdmin)
+				a.send(msg.Chat.ID, "❌ Ariza rad etildi. Qayta ariza uchun Zayafka botidan foydalaning.")
+				continue
+			}
+			// Superadmin or branch admin: password prompt
+			if a.superAdminID != 0 && userID == a.superAdminID && a.login != "" {
+				if wait, _ := services.LoginThrottleWaitSeconds(ctx, userID, services.ThrottleRoleSuperadmin); wait > 0 {
+					a.send(msg.Chat.ID, fmt.Sprintf("⏳ Iltimos %d soniya kutib qayta urinib ko'ring.", wait))
+				} else if text == a.login {
+					_ = services.RecordLoginSuccess(ctx, userID, services.ThrottleRoleSuperadmin)
+					a.setLoggedIn(userID, "super")
+					a.sendAdminPanel(msg.Chat.ID, userID)
+				} else {
+					_ = services.RecordLoginFailed(ctx, userID, services.ThrottleRoleSuperadmin)
+					a.send(msg.Chat.ID, adderLoginPrompt)
+				}
 			} else {
-				a.send(msg.Chat.ID, "🔒 Send your admin password to access the panel. (Big admin: use LOGIN password; branch admins: use the unique password set for your place.)")
+				if wait, _ := services.LoginThrottleWaitSeconds(ctx, userID, services.ThrottleRoleRestaurantAdmin); wait > 0 {
+					a.send(msg.Chat.ID, fmt.Sprintf("⏳ Iltimos %d soniya kutib qayta urinib ko'ring.", wait))
+				} else if locID, ok, err := services.AuthenticateBranchAdmin(ctx, userID, text); err == nil && ok {
+					_ = services.RecordLoginSuccess(ctx, userID, services.ThrottleRoleRestaurantAdmin)
+					a.setLoggedIn(userID, "branch")
+					a.stateMu.Lock()
+					a.activeLocation[userID] = locID
+					a.stateMu.Unlock()
+					locName, _ := services.GetLocationName(ctx, locID)
+					if locName != "" {
+						a.send(msg.Chat.ID, "✅ Logged in to «"+locName+"». You can add or edit menu items for your place.")
+					}
+					a.sendAdminPanel(msg.Chat.ID, userID)
+				} else {
+					_ = services.RecordLoginFailed(ctx, userID, services.ThrottleRoleRestaurantAdmin)
+					a.send(msg.Chat.ID, adderLoginPrompt)
+				}
 			}
 			continue
+		}
+
+		// Branch admin: gate by branch subscription (expired => deny and log out; no password rotation)
+		if a.getRole(userID) == "branch" {
+			ctx := context.Background()
+			locID, _ := services.GetAdminLocationID(ctx, userID)
+			if locID != 0 {
+				active, _ := services.LocationHasActiveSubscription(ctx, locID)
+				if !active {
+					services.MarkExpiredForBranch(ctx, locID)
+					a.clearLoggedIn(userID)
+					primaryID, _ := services.GetPrimaryAdminUserID(ctx, locID)
+					a.sendExpiredUserAndNotifySuperadmin(msg.Chat.ID, primaryID, services.UserRoleRestaurantAdmin, adderSubscriptionExpiredMsg)
+					continue
+				}
+			}
 		}
 
 		// Handle add menu item flow (name -> price)
@@ -134,6 +313,20 @@ func (a *AdderBot) Start() {
 			continue
 		}
 
+		// Expiry warning for branch admins (by primary's subscription)
+		if a.getRole(userID) == "branch" {
+			ctx := context.Background()
+			locID, _ := services.GetAdminLocationID(ctx, userID)
+			if locID != 0 {
+				primaryID, _ := services.GetPrimaryAdminUserID(ctx, locID)
+				if primaryID != 0 {
+					if within, warn := services.SubscriptionExpiresWithinDays(ctx, primaryID, services.UserRoleRestaurantAdmin, 3); within && warn != "" {
+						a.send(msg.Chat.ID, warn)
+					}
+				}
+			}
+		}
+
 		// Logged in, no state: show panel on any other message
 		a.sendAdminPanel(msg.Chat.ID, userID)
 	}
@@ -148,6 +341,77 @@ func (a *AdderBot) isLoggedIn(userID int64) bool {
 	ok := adderLoggedIn[userID]
 	adderLoggedInMu.RUnlock()
 	return ok
+}
+
+// requireAdminLogin returns (true, "") if user may access admin panel; (false, msg) if not logged in or subscription expired. For branch, checks by branch subscription (primary's), not current user.
+func (a *AdderBot) requireAdminLogin(chatID int64, userID int64) (allowed bool, denyMsg string) {
+	if !a.isLoggedIn(userID) {
+		return false, adderRequireLoginMsg
+	}
+	if a.getRole(userID) == "branch" {
+		ctx := context.Background()
+		locID, _ := services.GetAdminLocationID(ctx, userID)
+		if locID != 0 {
+			active, _ := services.LocationHasActiveSubscription(ctx, locID)
+			if !active {
+				services.MarkExpiredForBranch(ctx, locID)
+				a.clearLoggedIn(userID)
+				return false, adderSubscriptionExpiredMsg
+			}
+		}
+	}
+	return true, ""
+}
+
+// GetAPI returns the adder bot API.
+func (a *AdderBot) GetAPI() *tgbotapi.BotAPI {
+	return a.api
+}
+
+// SetZayafkaAPI sets the Zayafka bot API so adder can send password/rejection to applicants in the bot they used.
+func (a *AdderBot) SetZayafkaAPI(api *tgbotapi.BotAPI) {
+	a.zayafkaAPI = api
+}
+
+// SetOnSubscriptionRenewed sets the callback when a subscription is renewed (so background job can clear "already notified" for next expiry).
+func (a *AdderBot) SetOnSubscriptionRenewed(f func(tgUserID int64, role string)) {
+	a.onSubscriptionRenewed = f
+}
+
+// sendToSuperadminViaZayafka sends a message to superadmin in the Zayafka bot (so they get subscription alerts there too).
+func (a *AdderBot) sendToSuperadminViaZayafka(text string, kb tgbotapi.InlineKeyboardMarkup) {
+	if a.zayafkaAPI == nil || a.superAdminID == 0 {
+		return
+	}
+	msg := tgbotapi.NewMessage(a.superAdminID, text)
+	msg.ReplyMarkup = kb
+	if _, err := a.zayafkaAPI.Send(msg); err != nil {
+		log.Printf("adder: send to superadmin via zayafka: %v", err)
+	}
+}
+
+// sendToApplicant sends a message to the applicant (prefer Zayafka so they see it where they applied).
+func (a *AdderBot) sendToApplicant(chatID int64, text string) {
+	if a.zayafkaAPI != nil {
+		msg := tgbotapi.NewMessage(chatID, text)
+		if _, err := a.zayafkaAPI.Send(msg); err != nil {
+			log.Printf("adder: send to applicant via zayafka: %v", err)
+		}
+		return
+	}
+	a.send(chatID, text)
+}
+
+func (a *AdderBot) sendToApplicantWithInline(chatID int64, text string, kb tgbotapi.InlineKeyboardMarkup) {
+	if a.zayafkaAPI != nil {
+		msg := tgbotapi.NewMessage(chatID, text)
+		msg.ReplyMarkup = kb
+		if _, err := a.zayafkaAPI.Send(msg); err != nil {
+			log.Printf("adder: send to applicant via zayafka: %v", err)
+		}
+		return
+	}
+	a.sendWithInline(chatID, text, kb)
 }
 
 func (a *AdderBot) getRole(userID int64) string {
@@ -189,6 +453,341 @@ func (a *AdderBot) sendWithInline(chatID int64, text string, kb tgbotapi.InlineK
 	}
 }
 
+func (a *AdderBot) sendWithReplyKeyboard(chatID int64, text string, kb tgbotapi.ReplyKeyboardMarkup) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = kb
+	if _, err := a.api.Send(msg); err != nil {
+		log.Printf("adder send error: %v", err)
+	}
+}
+
+func (a *AdderBot) sendRemoveKeyboard(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = tgbotapi.NewRemoveKeyboard(true)
+	if _, err := a.api.Send(msg); err != nil {
+		log.Printf("adder send error: %v", err)
+	}
+}
+
+// sendExpiredUserAndNotifySuperadmin sends expiry message to user with "contact superadmin" button, and notifies superadmin once with "renew" button.
+func (a *AdderBot) sendExpiredUserAndNotifySuperadmin(userChatID int64, tgUserID int64, role string, denyMsg string) {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("📋 Yangilash so'rovini yuborish", "exp_contact")),
+	)
+	a.sendWithInline(userChatID, denyMsg, kb)
+
+	key := fmt.Sprintf("%d:%s", tgUserID, role)
+	a.stateMu.Lock()
+	already := a.expiredNotified[key]
+	if !already {
+		a.expiredNotified[key] = true
+	}
+	a.stateMu.Unlock()
+	if already || a.superAdminID == 0 {
+		return
+	}
+	superMsg := fmt.Sprintf("❌ Abonement tugadi: tg_user_id=%d role=%s\n\nYangi parol berish va abonement yangilash uchun quyidagi tugmani bosing.", tgUserID, role)
+	superKb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("✅ Yangilash (parol aylantirish)", fmt.Sprintf("exp_renew:%d:%s", tgUserID, role))),
+	)
+	a.sendWithInline(a.superAdminID, superMsg, superKb)
+	a.sendToSuperadminViaZayafka(superMsg, superKb)
+}
+
+// SendRenewalRequestToSuperadmin sends a "renewal request" message to superadmin (when expired user presses the button).
+func (a *AdderBot) SendRenewalRequestToSuperadmin(tgUserID int64, role string) {
+	adminChatID := a.superAdminID
+	if adminChatID == 0 && a.cfg != nil {
+		adminChatID = a.cfg.Telegram.SuperadminID
+	}
+	if adminChatID == 0 {
+		log.Printf("adder: SendRenewalRequestToSuperadmin skipped — superadmin ID not set (set ADMIN_ID or SUPERADMIN_TG_ID in .env)")
+		return
+	}
+	superMsg := fmt.Sprintf("📩 Yangilash so'rovi: tg_user_id=%d role=%s\n\nYangi parol berish va abonement yangilash uchun quyidagi tugmani bosing.", tgUserID, role)
+	superKb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("✅ Yangilash (parol aylantirish)", fmt.Sprintf("exp_renew:%d:%s", tgUserID, role))),
+	)
+	msg := tgbotapi.NewMessage(adminChatID, superMsg)
+	msg.ReplyMarkup = superKb
+	if _, err := a.api.Send(msg); err != nil {
+		log.Printf("adder: failed to send renewal request to superadmin (chat_id=%d): %v — ensure superadmin has started the Qo'shuvchi (adder) bot", adminChatID, err)
+		return
+	}
+	a.sendToSuperadminViaZayafka(superMsg, superKb)
+	log.Printf("adder: renewal request sent to superadmin (chat_id=%d) for tg_user_id=%d role=%s", adminChatID, tgUserID, role)
+}
+
+// NotifyExpiredUser sends the subscription-expired message with renewal button to the user (used by background job; for restaurant_admin sends via Zayafka when set).
+func (a *AdderBot) NotifyExpiredUser(chatID int64, tgUserID int64, role string) {
+	if chatID == 0 {
+		return
+	}
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("📋 Yangilash so'rovini yuborish", "exp_contact")),
+	)
+	a.sendToApplicantWithInline(chatID, services.SubscriptionDenyMessage, kb)
+}
+
+// SendExpiredNotificationToSuperadmin is called from driver bot (or elsewhere) when a driver's subscription expires.
+func (a *AdderBot) SendExpiredNotificationToSuperadmin(tgUserID int64, role string) {
+	if a.superAdminID == 0 {
+		return
+	}
+	key := fmt.Sprintf("%d:%s", tgUserID, role)
+	a.stateMu.Lock()
+	already := a.expiredNotified[key]
+	if !already {
+		a.expiredNotified[key] = true
+	}
+	a.stateMu.Unlock()
+	if already {
+		return
+	}
+	superMsg := fmt.Sprintf("❌ Abonement tugadi: tg_user_id=%d role=%s\n\nYangi parol berish va abonement yangilash uchun quyidagi tugmani bosing.", tgUserID, role)
+	superKb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("✅ Yangilash (parol aylantirish)", fmt.Sprintf("exp_renew:%d:%s", tgUserID, role))),
+	)
+	a.sendWithInline(a.superAdminID, superMsg, superKb)
+	a.sendToSuperadminViaZayafka(superMsg, superKb)
+}
+
+// HandleExpRenewFromZayafka runs renewal when superadmin taps the renew button in Zayafka; replyChatID is where to send confirmation (via Zayafka). For restaurant_admin only reactivates (no new password).
+func (a *AdderBot) HandleExpRenewFromZayafka(tgUserID int64, role string, replyChatID int64) {
+	ctx := context.Background()
+	newPass, err := services.RenewSubscription(ctx, tgUserID, role, 1, a.superAdminID, nil, "")
+	if err != nil {
+		a.sendToApplicant(replyChatID, "❌ "+err.Error())
+		return
+	}
+	a.stateMu.Lock()
+	delete(a.expiredNotified, fmt.Sprintf("%d:%s", tgUserID, role))
+	a.stateMu.Unlock()
+	if a.onSubscriptionRenewed != nil {
+		a.onSubscriptionRenewed(tgUserID, role)
+	}
+	if role == services.UserRoleRestaurantAdmin {
+		a.sendToApplicant(replyChatID, "✅ Abonement yangilandi. Parol o'zgarmadi.")
+	} else {
+		subChatID, _ := services.GetChatIDForSubscriber(ctx, tgUserID, role)
+		if subChatID != 0 {
+			a.sendToApplicant(subChatID, newPass)
+		}
+		if subChatID != 0 {
+			a.sendToApplicant(replyChatID, "✅ Yangilandi. Yangi parol Zayafka orqali foydalanuvchiga yuborildi.")
+		} else {
+			a.sendToApplicant(replyChatID, fmt.Sprintf("✅ Yangilandi. Yangi parol (qo'lda yuboring): %s", newPass))
+		}
+	}
+}
+
+func (a *AdderBot) handleApplyCommand(chatID int64, userID int64) {
+	a.send(chatID, "📋 Ariza yuborish uchun Zayavka botidan foydalaning.")
+}
+
+func (a *AdderBot) handleApplicationsCommand(chatID int64, userID int64) {
+	if a.superAdminID == 0 || userID != a.superAdminID {
+		return
+	}
+	a.send(chatID, "📋 Arizalarni Zayavka botda ko'ring.")
+}
+
+func (a *AdderBot) handleAddDriver(chatID int64, args string) {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		a.send(chatID, "Ishlatish: /add_driver <tg_user_id>\nHaydovchini qo'shadi, parol yuboradi. Haydovchi driver botda /login qiladi.")
+		return
+	}
+	var tgUserID int64
+	if _, err := fmt.Sscanf(args, "%d", &tgUserID); err != nil || tgUserID <= 0 {
+		a.send(chatID, "❌ tg_user_id raqam bo'lishi kerak.")
+		return
+	}
+	ctx := context.Background()
+	plainPass, err := services.AddDriverDirect(ctx, tgUserID)
+	if err != nil {
+		a.send(chatID, "❌ "+err.Error())
+		return
+	}
+	a.send(chatID, fmt.Sprintf("✅ Haydovchi qo'shildi (tg_user_id=%d).\n\n🔑 Parol: %s\n\nBu parolni haydovchiga yuboring. U driver botda /login qiladi.", tgUserID, plainPass))
+}
+
+func (a *AdderBot) handleSubsPending(chatID int64) {
+	ctx := context.Background()
+	list, err := services.ListExpiredSubscriptions(ctx, 50)
+	if err != nil {
+		a.send(chatID, "❌ "+err.Error())
+		return
+	}
+	if len(list) == 0 {
+		a.send(chatID, "📭 Tugagan abonementlar yo'q.")
+		return
+	}
+	var b strings.Builder
+	b.WriteString("📋 Tugagan / tugashga yaqin abonementlar:\n\n")
+	for _, r := range list {
+		b.WriteString(fmt.Sprintf("• tg_user_id=%d role=%s tugadi=%s\n", r.TgUserID, r.Role, r.ExpiresAt.Format("2006-01-02")))
+	}
+	b.WriteString("\nYangilash: /renew <tg_user_id> <role> [oylar=1] [summa]")
+	b.WriteString("\nParol yangilash: /reset_password <restaurant_id>")
+	a.send(chatID, b.String())
+}
+
+func (a *AdderBot) handleRenew(chatID int64, superadminID int64, args string) {
+	parts := strings.Fields(args)
+	if len(parts) < 2 {
+		a.send(chatID, "Ishlatish: /renew <tg_user_id> <role> [oylar=1] [summa]\nMisol: /renew 123456789 restaurant_admin 1 500000")
+		return
+	}
+	var tgUserID int64
+	if _, err := fmt.Sscanf(parts[0], "%d", &tgUserID); err != nil || tgUserID <= 0 {
+		a.send(chatID, "❌ tg_user_id raqam bo'lishi kerak.")
+		return
+	}
+	role := strings.ToLower(parts[1])
+	if role != services.UserRoleRestaurantAdmin && role != services.UserRoleDriver {
+		a.send(chatID, "❌ role: restaurant_admin yoki driver")
+		return
+	}
+	days := 1
+	if len(parts) >= 3 {
+		if n, err := strconv.Atoi(parts[2]); err == nil && n > 0 {
+			days = n
+		}
+	}
+	var amount *float64
+	if len(parts) >= 4 {
+		if v, err := strconv.ParseFloat(parts[3], 64); err == nil && v >= 0 {
+			amount = &v
+		}
+	}
+	ctx := context.Background()
+	newPass, err := services.RenewSubscription(ctx, tgUserID, role, days, superadminID, amount, "")
+	if err != nil {
+		a.send(chatID, "❌ "+err.Error())
+		return
+	}
+	if role == services.UserRoleRestaurantAdmin {
+		if a.onSubscriptionRenewed != nil {
+			a.onSubscriptionRenewed(tgUserID, role)
+		}
+		a.send(chatID, fmt.Sprintf("✅ Abonement yangilandi (tg_user_id=%d, role=%s). Parol o'zgarmadi.", tgUserID, role))
+	} else {
+		userChatID, _ := services.GetChatIDForSubscriber(ctx, tgUserID, role)
+		if userChatID != 0 {
+			a.sendToApplicant(userChatID, newPass)
+		}
+		if a.onSubscriptionRenewed != nil {
+			a.onSubscriptionRenewed(tgUserID, role)
+		}
+		a.send(chatID, fmt.Sprintf("✅ Abonement yangilandi (tg_user_id=%d, role=%s). Yangi parol Zayafka orqali foydalanuvchiga yuborildi.", tgUserID, role))
+	}
+}
+
+func (a *AdderBot) handleResetPassword(chatID int64, args string) {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		a.send(chatID, "Ishlatish: /reset_password <restaurant_id>\nrestaurant_id = filial (location) ID raqami.")
+		return
+	}
+	var branchLocationID int64
+	if _, err := fmt.Sscanf(args, "%d", &branchLocationID); err != nil || branchLocationID <= 0 {
+		a.send(chatID, "❌ restaurant_id musbat raqam bo'lishi kerak.")
+		return
+	}
+	ctx := context.Background()
+	newPass, primaryTgUserID, err := services.ResetBranchAdminPassword(ctx, branchLocationID)
+	if err != nil {
+		a.send(chatID, "❌ "+err.Error())
+		return
+	}
+	userChatID, _ := services.GetChatIDForSubscriber(ctx, primaryTgUserID, services.UserRoleRestaurantAdmin)
+	if userChatID != 0 {
+		a.sendToApplicant(userChatID, "🔄 Yangi parol: "+newPass+"\n(Superadmin parolni yangiladi.)")
+	}
+	locName, _ := services.GetLocationName(ctx, branchLocationID)
+	a.send(chatID, fmt.Sprintf("✅ Parol yangilandi (filial_id=%d %s). Yangi parol Zayafka orqali yuborildi.", branchLocationID, locName))
+}
+
+func (a *AdderBot) handleSubInfo(chatID int64, args string) {
+	parts := strings.Fields(args)
+	if len(parts) < 2 {
+		a.send(chatID, "Ishlatish: /sub_info <tg_user_id> <role>")
+		return
+	}
+	var tgUserID int64
+	if _, err := fmt.Sscanf(parts[0], "%d", &tgUserID); err != nil || tgUserID <= 0 {
+		a.send(chatID, "❌ tg_user_id raqam bo'lishi kerak.")
+		return
+	}
+	role := strings.ToLower(parts[1])
+	if role != services.UserRoleRestaurantAdmin && role != services.UserRoleDriver {
+		a.send(chatID, "❌ role: restaurant_admin yoki driver")
+		return
+	}
+	ctx := context.Background()
+	sub, err := services.GetSubscription(ctx, tgUserID, role)
+	if err != nil {
+		a.send(chatID, "❌ Abonement topilmadi.")
+		return
+	}
+	msg := fmt.Sprintf("📋 tg_user_id=%d role=%s\nstatus=%s\nstart=%s\nexpires=%s",
+		sub.TgUserID, sub.Role, sub.Status,
+		sub.StartAt.Format("2006-01-02"), sub.ExpiresAt.Format("2006-01-02"))
+	if sub.LastPaymentAt != nil {
+		msg += "\nlast_payment=" + sub.LastPaymentAt.Format("2006-01-02")
+	}
+	a.send(chatID, msg)
+}
+
+func (a *AdderBot) handlePause(chatID int64, args string) {
+	parts := strings.Fields(args)
+	if len(parts) < 2 {
+		a.send(chatID, "Ishlatish: /pause <tg_user_id> <role>")
+		return
+	}
+	var tgUserID int64
+	if _, err := fmt.Sscanf(parts[0], "%d", &tgUserID); err != nil || tgUserID <= 0 {
+		a.send(chatID, "❌ tg_user_id raqam bo'lishi kerak.")
+		return
+	}
+	role := strings.ToLower(parts[1])
+	if role != services.UserRoleRestaurantAdmin && role != services.UserRoleDriver {
+		a.send(chatID, "❌ role: restaurant_admin yoki driver")
+		return
+	}
+	ctx := context.Background()
+	if err := services.PauseSubscription(ctx, tgUserID, role); err != nil {
+		a.send(chatID, "❌ "+err.Error())
+		return
+	}
+	a.send(chatID, fmt.Sprintf("✅ Abonement to'xtatildi (tg_user_id=%d, role=%s).", tgUserID, role))
+}
+
+func (a *AdderBot) handleUnpause(chatID int64, args string) {
+	parts := strings.Fields(args)
+	if len(parts) < 2 {
+		a.send(chatID, "Ishlatish: /unpause <tg_user_id> <role>")
+		return
+	}
+	var tgUserID int64
+	if _, err := fmt.Sscanf(parts[0], "%d", &tgUserID); err != nil || tgUserID <= 0 {
+		a.send(chatID, "❌ tg_user_id raqam bo'lishi kerak.")
+		return
+	}
+	role := strings.ToLower(parts[1])
+	if role != services.UserRoleRestaurantAdmin && role != services.UserRoleDriver {
+		a.send(chatID, "❌ role: restaurant_admin yoki driver")
+		return
+	}
+	ctx := context.Background()
+	if err := services.UnpauseSubscription(ctx, tgUserID, role); err != nil {
+		a.send(chatID, "❌ "+err.Error())
+		return
+	}
+	a.send(chatID, fmt.Sprintf("✅ Abonement davom ettirildi (tg_user_id=%d, role=%s).", tgUserID, role))
+}
+
 func (a *AdderBot) handleStart(chatID int64, userID int64) {
 	// If already logged in, show the panel instead of asking for password again.
 	if a.isLoggedIn(userID) {
@@ -224,7 +823,8 @@ func (a *AdderBot) handleStart(chatID int64, userID int64) {
 		return
 	}
 
-	a.send(chatID, "🔒 Admin panel. Send your password to continue (big admin: LOGIN; branch admin: your unique password).")
+	// Not logged in: password only (application form is in Zayavka bot)
+	a.send(chatID, adderLoginPrompt)
 }
 
 func (a *AdderBot) adminKeyboard(userID int64) tgbotapi.InlineKeyboardMarkup {
@@ -289,10 +889,30 @@ func (a *AdderBot) adminKeyboard(userID int64) tgbotapi.InlineKeyboardMarkup {
 }
 
 func (a *AdderBot) sendAdminPanel(chatID int64, userID int64) {
+	role := a.getRole(userID)
+	if role == "branch" {
+		ctx := context.Background()
+		locID, _ := services.GetAdminLocationID(ctx, userID)
+		if locID != 0 {
+			active, _ := services.LocationHasActiveSubscription(ctx, locID)
+			if !active {
+				services.MarkExpiredForBranch(ctx, locID)
+				a.clearLoggedIn(userID)
+				primaryID, _ := services.GetPrimaryAdminUserID(ctx, locID)
+				a.sendExpiredUserAndNotifySuperadmin(chatID, primaryID, services.UserRoleRestaurantAdmin, adderSubscriptionExpiredMsg)
+				return
+			}
+			primaryID, _ := services.GetPrimaryAdminUserID(ctx, locID)
+			if primaryID != 0 {
+				if within, warn := services.SubscriptionExpiresWithinDays(ctx, primaryID, services.UserRoleRestaurantAdmin, 3); within && warn != "" {
+					a.send(chatID, warn)
+				}
+			}
+		}
+	}
 	a.stateMu.RLock()
 	locID := a.activeLocation[userID]
 	a.stateMu.RUnlock()
-	role := a.getRole(userID)
 
 	if locID <= 0 {
 		text := "📋 Admin — Locations\n\nAvval menyu uchun filialni tanlang yoki yangi fast food joyini qo'shing."
@@ -366,7 +986,73 @@ func (a *AdderBot) handleCallback(cq *tgbotapi.CallbackQuery) {
 
 	a.api.Request(tgbotapi.NewCallback(cq.ID, ""))
 
-	if !a.isLoggedIn(userID) {
+	// Expired subscription: user sends renewal request to superadmin
+	if data == "exp_contact" {
+		// Caller is the expired user (branch admin in adder)
+		a.SendRenewalRequestToSuperadmin(userID, services.UserRoleRestaurantAdmin)
+		a.send(chatID, "✅ So'rovingiz superadmin ga yuborildi. Tez orada yangilash tugmasi orqali parol yuboriladi.")
+		return
+	}
+	// Expired subscription: superadmin renews (rotate password, send to location admin / driver)
+	if strings.HasPrefix(data, "exp_renew:") {
+		rest := strings.TrimPrefix(data, "exp_renew:")
+		parts := strings.SplitN(rest, ":", 2)
+		if len(parts) != 2 || a.superAdminID == 0 || userID != a.superAdminID {
+			return
+		}
+		var tgUserID int64
+		if _, err := fmt.Sscanf(parts[0], "%d", &tgUserID); err != nil || tgUserID <= 0 {
+			a.send(chatID, "❌ Noto'g'ri format.")
+			return
+		}
+		role := parts[1]
+		if role != services.UserRoleRestaurantAdmin && role != services.UserRoleDriver {
+			a.send(chatID, "❌ Noto'g'ri role.")
+			return
+		}
+		ctx := context.Background()
+		newPass, err := services.RenewSubscription(ctx, tgUserID, role, 1, userID, nil, "")
+		if err != nil {
+			a.send(chatID, "❌ "+err.Error())
+			return
+		}
+		if role == services.UserRoleRestaurantAdmin {
+			// Reactivate only; no new password
+			a.stateMu.Lock()
+			delete(a.expiredNotified, fmt.Sprintf("%d:%s", tgUserID, role))
+			a.stateMu.Unlock()
+			if a.onSubscriptionRenewed != nil {
+				a.onSubscriptionRenewed(tgUserID, role)
+			}
+			a.send(chatID, "✅ Abonement yangilandi. Parol o'zgarmadi.")
+		} else {
+			subChatID, _ := services.GetChatIDForSubscriber(ctx, tgUserID, role)
+			if subChatID != 0 {
+				a.sendToApplicant(subChatID, newPass)
+			}
+			a.stateMu.Lock()
+			delete(a.expiredNotified, fmt.Sprintf("%d:%s", tgUserID, role))
+			a.stateMu.Unlock()
+			if a.onSubscriptionRenewed != nil {
+				a.onSubscriptionRenewed(tgUserID, role)
+			}
+			if subChatID != 0 {
+				a.send(chatID, "✅ Yangilandi. Yangi parol Zayafka orqali foydalanuvchiga yuborildi.")
+			} else {
+				a.send(chatID, fmt.Sprintf("✅ Yangilandi. Yangi parol (qo'lda yuboring): %s", newPass))
+			}
+		}
+		return
+	}
+
+	if data == "apply_start" {
+		a.send(chatID, "📋 Ariza yuborish uchun Zayavka botidan foydalaning.")
+		return
+	}
+
+	// Admin panel: require login and active subscription (applications/approve only in Zayavka).
+	if ok, msg := a.requireAdminLogin(chatID, userID); !ok {
+		a.send(chatID, msg)
 		return
 	}
 

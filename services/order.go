@@ -75,16 +75,24 @@ func HaversineDistanceKm(lat1, lon1, lat2, lon2 float64) float64 {
 }
 
 func CreateOrder(ctx context.Context, input models.CreateOrderInput) (int64, error) {
-	grandTotal := input.ItemsTotal + input.DeliveryFee
+	deliveryType := input.DeliveryType
+	if deliveryType != "delivery" && deliveryType != "pickup" {
+		deliveryType = "pickup"
+	}
+	deliveryFee := input.DeliveryFee
+	if deliveryType == "pickup" {
+		deliveryFee = 0
+	}
+	grandTotal := input.ItemsTotal + deliveryFee
 	var id int64
 	err := db.Pool.QueryRow(ctx, `
 		INSERT INTO orders (
 			user_id, chat_id, phone, lat, lon, distance_km, rate_per_km,
-			delivery_fee, items_total, grand_total, status, location_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			delivery_fee, items_total, grand_total, status, location_id, delivery_type
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id`,
 		input.UserID, input.ChatID, input.Phone, input.Lat, input.Lon, input.DistanceKm,
-		4000, input.DeliveryFee, input.ItemsTotal, grandTotal, OrderStatusNew, input.LocationID,
+		4000, deliveryFee, input.ItemsTotal, grandTotal, OrderStatusNew, input.LocationID, deliveryType,
 	).Scan(&id)
 	return id, err
 }
@@ -121,6 +129,39 @@ func GetOrderCoordinates(ctx context.Context, orderID int64) (lat, lon float64, 
 		return 0, 0, err
 	}
 	return lat, lon, nil
+}
+
+// CustomerOrderRow is a summary row for /orders list.
+type CustomerOrderRow struct {
+	ID         int64
+	Status     string
+	GrandTotal int64
+	CreatedAt  string
+}
+
+// ListOrdersByUserID returns recent orders for the customer (user_id), newest first, limit 20.
+func ListOrdersByUserID(ctx context.Context, userID int64, limit int) ([]CustomerOrderRow, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := db.Pool.Query(ctx, `
+		SELECT id, status, grand_total, created_at::text
+		FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
+		userID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []CustomerOrderRow
+	for rows.Next() {
+		var r CustomerOrderRow
+		if err := rows.Scan(&r.ID, &r.Status, &r.GrandTotal, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, r)
+	}
+	return list, rows.Err()
 }
 
 // TrySetOrderPushedAt sets orders.pushed_at = NOW() only if pushed_at IS NULL (one-shot claim for driver push).
@@ -179,9 +220,13 @@ var validStatusTransition = map[string]string{
 
 // ValidStatusTransition returns true if transitioning from 'from' to 'to' is allowed.
 func ValidStatusTransition(from, to string) bool {
-	// Special case: ready -> completed is allowed for pickup orders
+	// ready -> completed is only allowed in UpdateOrderStatus for pickup (validated there)
 	if from == OrderStatusReady && to == OrderStatusCompleted {
-		return true // Will be validated in UpdateOrderStatus based on delivery_type
+		return false
+	}
+	// Driver can mark assigned -> completed (or via picked_up -> delivering -> completed)
+	if from == OrderStatusAssigned && to == OrderStatusCompleted {
+		return true
 	}
 	// Admin can reject a new order
 	if from == OrderStatusNew && to == OrderStatusRejected {
@@ -232,7 +277,10 @@ func UpdateOrderStatus(ctx context.Context, orderID int64, newStatus string, adm
 			return fmt.Errorf("bu buyurtma driverga biriktirilgan. Yakunlashni driver qiladi")
 		}
 	}
-	if !ValidStatusTransition(o.Status, newStatus) {
+	// Allow ready -> completed only for pickup (already validated above when newStatus == completed)
+	allowTransition := ValidStatusTransition(o.Status, newStatus) ||
+		(o.Status == OrderStatusReady && newStatus == OrderStatusCompleted)
+	if !allowTransition {
 		return fmt.Errorf("invalid status transition from %q to %q", o.Status, newStatus)
 	}
 	fromStatus := o.Status

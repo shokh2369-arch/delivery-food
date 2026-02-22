@@ -22,11 +22,13 @@ type DBConfig struct {
 }
 
 type TelegramConfig struct {
-	Token       string
-	AdderToken  string
-	MessageToken string // token for sending order notifications to admin
-	DriverToken string // token for driver bot
-	Login       string // admin password for adder bot
+	Token         string
+	AdderToken    string
+	ZayafkaToken  string // token for application-form-only bot (ariza)
+	MessageToken  string // token for sending order notifications to admin
+	DriverToken   string // token for driver bot
+	Login         string // admin password for adder bot
+	SuperadminID  int64  // Telegram ID for superadmin (/applications); 0 = use ADMIN_ID from env at runtime
 }
 
 type DeliveryConfig struct {
@@ -52,9 +54,11 @@ func Load() (*Config, error) {
 		Telegram: TelegramConfig{
 			Token:        getEnv("TOKEN", ""),
 			AdderToken:   getEnv("ADDER_TOKEN", ""),
+			ZayafkaToken: getEnv("ZAYAFKA", ""),
 			MessageToken: getEnv("MESSAGE_TOKEN", ""),
 			DriverToken:  getEnv("DRIVER_BOT_TOKEN", ""),
 			Login:        getEnv("LOGIN", ""),
+			SuperadminID: getSuperadminID(),
 		},
 		Delivery: DeliveryConfig{
 			BaseFee:            getBaseFee(),   // 5000 sum start
@@ -107,4 +111,13 @@ func getDriverPushRadiusKm() float64 {
 		}
 	}
 	return 5.0
+}
+
+func getSuperadminID() int64 {
+	if v := os.Getenv("SUPERADMIN_TG_ID"); v != "" {
+		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return id
+		}
+	}
+	return 0
 }
